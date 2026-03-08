@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+weaviate-client>=4.0.0
+pytesseract
+openai
+python-docx
+pycryptodome
+beautifulsoup4
+requests
+urllib3
+pydantic
+python-dotenv
