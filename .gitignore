@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local development outputs
+logs/ingest_dev.jsonl
+data/board_candidates.json
+data/board_filtered_rule.json
+data/board_filtered_llm.json

@@ -159,18 +159,21 @@ def llm_refine_filter(board_list: list[dict], *, use_llm: bool = True) -> Filter
         "{{BOARD_LIST_JSON}}",
         json.dumps(board_list, ensure_ascii=False, indent=2),
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content
+        parsed = json.loads(raw)
+    except Exception:
+        return baseline
 
-    raw = resp.choices[0].message.content
-    parsed = json.loads(raw)
     reg_list = parsed.get("regulation_list", [])
     keep_urls = [
         (r.get("keep") or {}).get("source_url", "")
