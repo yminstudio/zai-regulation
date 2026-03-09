@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import argparse
 
 from src.config import DATA_DIR
 from src.dev_log import write_dev_log, DEV_LOG_PATH
@@ -19,13 +19,18 @@ from src.gw_list_fetcher import fetch_board_list
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="최근 N개 게시글 첨부 추출 테스트")
+    parser.add_argument("--limit", type=int, default=5, help="처리할 게시글 수 (기본 5)")
+    args = parser.parse_args()
+
     gw = GWDownloader()
     board = [x.to_dict() for x in fetch_board_list(gw)]
-    recent10 = board[:10]
+    recent10 = board[: max(1, args.limit)]
 
     write_dev_log(
         "recent10_selected",
         {
+            "limit": args.limit,
             "count": len(recent10),
             "items": [
                 {
@@ -113,7 +118,12 @@ def main() -> None:
 
     write_dev_log(
         "recent10_done",
-        {"files_processed": len(extracted_rows), "output_json": str(out_path)},
+        {
+            "limit": args.limit,
+            "posts_processed": len(recent10),
+            "files_processed": len(extracted_rows),
+            "output_json": str(out_path),
+        },
     )
     print(f"saved: {out_path}")
     print(f"log:   {DEV_LOG_PATH}")
