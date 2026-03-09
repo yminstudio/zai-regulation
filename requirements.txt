@@ -10,3 +10,7 @@ requests
 urllib3
 pydantic
 python-dotenv
+pypdf
+pypdfium2
+openpyxl
+xlrd
