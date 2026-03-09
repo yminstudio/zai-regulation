@@ -1,12 +1,13 @@
 """게시판 목록 수집기.
 
-GWDownloader의 로그인 세션을 활용하여 selectMessageGridList.do API를 호출하고,
-전체 게시글 메타(제목, 등록일, URL, messageID)를 페이지네이션으로 수집합니다.
+GWDownloader의 로그인 세션으로 selectMessageGridList.do API를 호출하고,
+최신 규정 선별용 후보 JSON(5필드) 리스트를 수집합니다.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, asdict
+from datetime import datetime
 
 from src.config import GW_BASE_URL, GW_BOARD_FOLDER_ID
 from src.gw_downloader import GWDownloader
@@ -27,23 +28,38 @@ VIEW_URL_TEMPLATE = (
 
 
 @dataclass
-class BoardItem:
-    """게시글 메타 정보 1건."""
+class BoardCandidate:
+    """최신 규정 선별용 후보 1건(요청한 5필드)."""
     title: str
-    registered_at: str
-    url: str
-    message_id: str
+    reg_date: str
+    source_url: str
+    reg_num: int
+    reg_user: str
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _to_iso_date(raw: str) -> str:
+    """그룹웨어 날짜 문자열을 ISO 날짜(YYYY-MM-DD)로 변환."""
+    v = (raw or "").strip()
+    if not v:
+        return ""
+
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y.%m.%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return v[:10]
 
 
 def fetch_board_list(
     gw: GWDownloader,
     folder_id: str = GW_BOARD_FOLDER_ID,
     page_size: int = 10,
-) -> list[BoardItem]:
-    """게시판 전체 목록을 페이지네이션으로 수집합니다.
+) -> list[BoardCandidate]:
+    """게시판 전체 목록을 최신 규정 선별용 5필드 구조로 수집합니다.
 
     Args:
         gw: 로그인된 GWDownloader 인스턴스
@@ -51,7 +67,7 @@ def fetch_board_list(
         page_size: 한 페이지당 요청 건수
 
     Returns:
-        BoardItem 리스트 (전체 게시글)
+        BoardCandidate 리스트
     """
     gw.ensure_logged_in(
         return_url=(
@@ -61,7 +77,7 @@ def fetch_board_list(
         )
     )
 
-    all_items: list[BoardItem] = []
+    all_items: list[BoardCandidate] = []
     page_no = 1
     total_count = -1
 
@@ -120,7 +136,13 @@ def fetch_board_list(
 
             message_id = item.get("MessageID")
             title = item.get("Subject", "").strip()
-            registered_at = item.get("RegistDate", "").strip()
+            reg_date = _to_iso_date(item.get("RegistDate", ""))
+            reg_user = (
+                item.get("CreatorName")
+                or item.get("CreatorDept")
+                or item.get("OwnerName")
+                or ""
+            ).strip()
 
             if not message_id or not title:
                 continue
@@ -130,10 +152,20 @@ def fetch_board_list(
                 page=page_no, page_size=page_size, r_num=r_num,
             )
 
-            all_items.append(BoardItem(
-                title=title, registered_at=registered_at,
-                url=url, message_id=message_id,
-            ))
+            try:
+                reg_num = int(str(message_id))
+            except ValueError:
+                reg_num = 0
+
+            all_items.append(
+                BoardCandidate(
+                    title=title,
+                    reg_date=reg_date,
+                    source_url=url,
+                    reg_num=reg_num,
+                    reg_user=reg_user,
+                )
+            )
 
         page_count = data.get("page", {}).get("pageCount", 0)
         if page_no >= page_count:
