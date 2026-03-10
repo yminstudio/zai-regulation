@@ -18,6 +18,7 @@ import warnings
 import logging
 from pathlib import Path
 from dataclasses import dataclass
+import html
 
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -185,6 +186,62 @@ class GWDownloader:
             raise RuntimeError(f"게시글 조회 실패: {data}")
 
         return data.get("fileList", [])
+
+    def fetch_message_detail(self, board_url: str) -> dict:
+        """게시글 상세 원본(dict) 반환."""
+        params = self.parse_url_params(board_url)
+        message_id = params.get("messageID", "")
+        folder_id = params.get("folderID", "")
+        version = params.get("version", "1")
+        if not message_id or not folder_id:
+            raise ValueError(f"URL에서 messageID/folderID를 찾을 수 없습니다: {board_url}")
+
+        self.ensure_logged_in(return_url=board_url)
+        self.session.get(board_url, verify=False)
+        resp = self.session.post(
+            MESSAGE_DETAIL_URL,
+            data={
+                "bizSection": "Board",
+                "version": version,
+                "messageID": message_id,
+                "folderID": folder_id,
+                "readFlagStr": "true",
+            },
+            headers={
+                **BROWSER_HEADERS,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": board_url,
+            },
+            verify=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "SUCCESS":
+            raise RuntimeError(f"게시글 조회 실패: {data}")
+        return data.get("list", {}) or {}
+
+    def fetch_source_text(self, board_url: str) -> str:
+        """게시글 본문 텍스트(source_text) 반환."""
+        detail = self.fetch_message_detail(board_url)
+        body_text = (detail.get("BodyText") or "").strip()
+        if body_text:
+            return body_text
+
+        raw_body = detail.get("Body") or ""
+        if not raw_body:
+            return ""
+        # URL 인코딩 HTML 본문을 복원해 텍스트화
+        decoded = urllib.parse.unquote(raw_body)
+        decoded = re.sub(
+            r"%u([0-9A-Fa-f]{4})",
+            lambda m: chr(int(m.group(1), 16)),
+            decoded,
+        )
+        decoded = html.unescape(decoded)
+        decoded = re.sub(r"<[^>]+>", " ", decoded)
+        decoded = re.sub(r"\s+", " ", decoded).strip()
+        return decoded
 
     # ------------------------------------------------------------------
     # 첨부파일 다운로드
