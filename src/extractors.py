@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import re
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -31,28 +32,75 @@ def _clean_text(value: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", (value or "").strip())
 
 
+def _read_text_with_fallback(path: Path) -> str:
+    raw = path.read_bytes()
+    for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _convert_with_office(input_path: Path, out_dir: Path, target: str) -> Path | None:
+    """LibreOffice/soffice/lowriter 중 가능한 실행기로 변환."""
+    for cmd in ("libreoffice", "soffice", "lowriter"):
+        try:
+            proc = subprocess.run(
+                [
+                    cmd,
+                    "--headless",
+                    "--convert-to",
+                    target,
+                    "--outdir",
+                    str(out_dir),
+                    str(input_path.resolve()),
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                continue
+            produced = sorted(out_dir.glob(f"{input_path.stem}.*"))
+            if produced:
+                return produced[0]
+        except Exception:
+            continue
+    return None
+
+
 def _ocr_image_file(path: Path) -> str:
     img = Image.open(path)
     return _clean_text(pytesseract.image_to_string(img, lang=OCR_LANG))
 
 
 def _extract_pdf_text(path: Path) -> tuple[str, str]:
+    """PDF는 페이지별로 텍스트 품질을 보고 OCR을 혼합 적용."""
     reader = PdfReader(str(path))
-    parts: list[str] = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    text = _clean_text("\n".join(parts))
-    if len(text) >= 50:
-        return text, "pdf_text"
-
-    # 텍스트가 거의 없으면 이미지 PDF로 판단하여 OCR 수행
     doc = pdfium.PdfDocument(str(path))
-    ocr_parts: list[str] = []
-    for idx in range(len(doc)):
-        page = doc[idx]
-        pil = page.render(scale=2).to_pil()
-        ocr_parts.append(pytesseract.image_to_string(pil, lang=OCR_LANG))
-    return _clean_text("\n".join(ocr_parts)), "pdf_ocr"
+    parts: list[str] = []
+    used_ocr = False
+
+    for idx, page in enumerate(reader.pages):
+        page_text = (page.extract_text() or "").strip()
+        # 페이지 텍스트가 충분하면 우선 사용
+        if len(page_text) >= 80:
+            parts.append(page_text)
+            continue
+
+        # 부족한 페이지만 OCR
+        used_ocr = True
+        pil = doc[idx].render(scale=2).to_pil()
+        ocr_text = pytesseract.image_to_string(pil, lang=OCR_LANG).strip()
+        if ocr_text:
+            parts.append(ocr_text)
+        else:
+            parts.append(page_text)
+
+    text = _clean_text("\n".join(parts))
+    if used_ocr:
+        return text, "pdf_mixed_ocr"
+    return text, "pdf_text"
 
 
 def _extract_docx_text(path: Path) -> str:
@@ -61,8 +109,9 @@ def _extract_docx_text(path: Path) -> str:
     return _clean_text("\n".join(lines))
 
 
-def _extract_doc_text(path: Path) -> str:
-    # antiword가 있으면 사용
+def _extract_doc_text(path: Path) -> tuple[str, str]:
+    """.doc 추출: antiword -> catdoc -> office(txt) -> office(docx) -> 변환필요."""
+    # antiword
     try:
         result = subprocess.run(
             ["antiword", str(path)],
@@ -71,9 +120,42 @@ def _extract_doc_text(path: Path) -> str:
             stderr=subprocess.PIPE,
             text=True,
         )
-        return _clean_text(result.stdout)
+        return _clean_text(result.stdout), "doc_antiword"
     except Exception:
-        return ""
+        pass
+    # catdoc
+    try:
+        result = subprocess.run(
+            ["catdoc", str(path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return _clean_text(result.stdout), "doc_catdoc"
+    except Exception:
+        pass
+    # 방법 A-1: office로 .txt 변환 후 읽기
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            txt_path = _convert_with_office(path, out_dir, "txt")
+            if txt_path and txt_path.suffix.lower() == ".txt":
+                text = _read_text_with_fallback(txt_path)
+                return _clean_text(text), "doc_office_txt"
+    except Exception:
+        pass
+    # 방법 A-2: office로 .docx 변환 후 python-docx로 읽기
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            docx_path = _convert_with_office(path, out_dir, "docx")
+            if docx_path and docx_path.suffix.lower() == ".docx":
+                return _extract_docx_text(docx_path), "doc_office_docx"
+    except Exception:
+        pass
+    # 실무 정책: .doc는 변환 성공 시에만 처리, 실패하면 변환 필요로 남김
+    return "", "doc_needs_docx_conversion"
 
 
 def _extract_xlsx_text(path: Path) -> str:
@@ -119,8 +201,8 @@ def _extract_hwpx_text(path: Path) -> str:
         return ""
 
 
-def _extract_hwp_text(path: Path) -> str:
-    # hwp5txt 명령이 설치된 경우에만 사용
+def _extract_hwp_text(path: Path) -> tuple[str, str]:
+    """HWP 추출: hwp5txt -> LibreOffice headless -> strings. 반환 (텍스트, 방법)."""
     try:
         result = subprocess.run(
             ["hwp5txt", str(path)],
@@ -129,9 +211,29 @@ def _extract_hwp_text(path: Path) -> str:
             stderr=subprocess.PIPE,
             text=True,
         )
-        return _clean_text(result.stdout)
+        return _clean_text(result.stdout), "hwp_hwp5txt"
     except Exception:
-        return ""
+        pass
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            txt_path = _convert_with_office(path, out_dir, "txt")
+            if txt_path and txt_path.suffix.lower() == ".txt":
+                text = _read_text_with_fallback(txt_path)
+                return _clean_text(text), "hwp_office_txt"
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["strings", str(path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return _clean_text(result.stdout), "hwp_strings"
+    except Exception:
+        return "", "hwp_failed"
 
 
 def extract_text(path: str | Path) -> tuple[str, str]:
@@ -150,7 +252,7 @@ def extract_text(path: str | Path) -> tuple[str, str]:
     if ext == ".docx":
         return _extract_docx_text(p), "docx"
     if ext == ".doc":
-        return _extract_doc_text(p), "doc"
+        return _extract_doc_text(p)
     if ext == ".xlsx":
         return _extract_xlsx_text(p), "xlsx"
     if ext == ".xls":
@@ -158,7 +260,7 @@ def extract_text(path: str | Path) -> tuple[str, str]:
     if ext == ".hwpx":
         return _extract_hwpx_text(p), "hwpx"
     if ext == ".hwp":
-        return _extract_hwp_text(p), "hwp"
+        return _extract_hwp_text(p)
 
     # 텍스트 계열 fallback
     try:
