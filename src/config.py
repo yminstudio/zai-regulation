@@ -29,6 +29,7 @@ GW_BOARD_FOLDER_ID: str = os.getenv("GW_BOARD_FOLDER_ID", "8233")
 
 # --- Weaviate ---
 WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+PROJECT_WEAVIATE_CLASS: str = os.getenv("PROJECT_WEAVIATE_CLASS", "ZrRegulationZeroInV1")
 
 # --- Paths ---
 DATA_DIR: Path = PROJECT_ROOT / "data"
