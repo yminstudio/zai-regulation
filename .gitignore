@@ -207,13 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 # Local development outputs
-logs/ingest_dev.jsonl
-data/board_candidates.json
-data/board_filtered_rule.json
-data/board_filtered_llm.json
-data/board_filtered_rule_documents.json
-data/board_filtered_llm_documents.json
-data/recent10_attachment_texts.json
+logs/ingest_pipeline.jsonl
+data/regulation_schema_seed.json
+data/regulation_texts_and_summaries.json
 data/*.pdf
 data/*.doc
 data/*.docx
