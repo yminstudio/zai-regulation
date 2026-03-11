@@ -11,7 +11,7 @@ from openai import OpenAI
 
 from src.config import EMBEDDING_MODEL, OPENAI_API_KEY, WEAVIATE_URL
 
-ALLOWED_CLASS_PREFIX = "ZrRegulation"
+ALLOWED_CLASS_PREFIX = "ZaiRegulation"
 
 
 def _utc_now() -> str:

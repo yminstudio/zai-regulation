@@ -84,6 +84,7 @@ class FilterResult:
     keep_count: int
     regulation_list: list[dict]
     keep_source_urls: list[str]
+    keep_items: list[dict]
 
 
 def normalize_title_to_key(title: str) -> str:
@@ -110,6 +111,22 @@ def _parse_date_safe(v: str) -> datetime:
     return datetime.min
 
 
+def _to_keep_item(item: dict) -> dict:
+    """후속 파이프라인 연계를 위한 keep 메타(스키마 seed 호환) 생성."""
+    return {
+        "original_id": item.get("original_id", ""),
+        "title": item.get("title", ""),
+        "reg_num": item.get("reg_num", 0),
+        "reg_user": item.get("reg_user", ""),
+        "reg_date": item.get("reg_date", ""),
+        "source_url": item.get("source_url", ""),
+        "source_text": item.get("source_text", ""),
+        "file_info": item.get("file_info", []),
+        "summary_text": item.get("summary_text", ""),
+        "summary_keywords": item.get("summary_keywords", []),
+    }
+
+
 def rule_based_filter(board_list: list[dict]) -> FilterResult:
     """규칙 기반 1차 최신본 선별."""
     groups: dict[str, list[dict]] = {}
@@ -119,6 +136,7 @@ def rule_based_filter(board_list: list[dict]) -> FilterResult:
 
     regulation_list: list[dict] = []
     keep_urls: list[str] = []
+    keep_items: list[dict] = []
     for key, items in groups.items():
         if len(items) == 1:
             keep = items[0]
@@ -136,12 +154,14 @@ def rule_based_filter(board_list: list[dict]) -> FilterResult:
             }
         )
         keep_urls.append(keep.get("source_url", ""))
+        keep_items.append(_to_keep_item(keep))
 
     return FilterResult(
         input_count=len(board_list),
         keep_count=len(keep_urls),
         regulation_list=regulation_list,
         keep_source_urls=keep_urls,
+        keep_items=keep_items,
     )
 
 
@@ -175,14 +195,22 @@ def llm_refine_filter(board_list: list[dict], *, use_llm: bool = True) -> Filter
         return baseline
 
     reg_list = parsed.get("regulation_list", [])
+    by_url = {b.get("source_url", ""): b for b in board_list}
     keep_urls = [
         (r.get("keep") or {}).get("source_url", "")
         for r in reg_list
         if (r.get("keep") or {}).get("source_url")
     ]
+    keep_items = []
+    for url in keep_urls:
+        base = by_url.get(url, {})
+        if base:
+            keep_items.append(_to_keep_item(base))
+
     return FilterResult(
         input_count=parsed.get("input_count", len(board_list)),
         keep_count=parsed.get("keep_count", len(keep_urls)),
         regulation_list=reg_list,
         keep_source_urls=keep_urls,
+        keep_items=keep_items,
     )

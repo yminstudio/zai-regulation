@@ -19,6 +19,14 @@ from src.gw_list_fetcher import fetch_board_list
 from src.log_utils import LOG_PATH, write_log
 
 OUTPUT_PATH = DATA_DIR / "regulation_schema_seed.json"
+EXCLUDED_ATTACHMENT_KEYWORDS = ("신규조문", "신구조문")
+
+
+def _is_excluded_attachment(file_name: str) -> bool:
+    name = (file_name or "").strip().lower()
+    if not name:
+        return False
+    return any(keyword.lower() in name for keyword in EXCLUDED_ATTACHMENT_KEYWORDS)
 
 
 def main() -> None:
@@ -65,17 +73,21 @@ def main() -> None:
         )
 
         attachments = gw.get_attachments(source_url)
+        kept_attachments = [a for a in attachments if not _is_excluded_attachment(a.file_name)]
+        skipped_file_names = [a.file_name for a in attachments if _is_excluded_attachment(a.file_name)]
         write_log(
             "attachments_listed",
             {
                 "source_url": source_url,
-                "count": len(attachments),
-                "file_names": [a.file_name for a in attachments],
+                "count": len(kept_attachments),
+                "file_names": [a.file_name for a in kept_attachments],
+                "skipped_count": len(skipped_file_names),
+                "skipped_file_names": skipped_file_names,
             },
         )
 
         file_info: list[dict] = []
-        for att in attachments:
+        for att in kept_attachments:
             try:
                 file_path = gw.download_file(att)
                 write_log(

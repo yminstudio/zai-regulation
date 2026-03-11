@@ -39,6 +39,17 @@ class RunPaths:
     manifest: Path
 
 
+@dataclass
+class PipelineOptions:
+    limit: int = 0
+    run_id: str = ""
+    use_llm_filter: bool = False
+    cleanup_enabled: bool = True
+    ingest_weaviate: bool = True
+    weaviate_class: str = PROJECT_WEAVIATE_CLASS
+    replace_own_collection: bool = True
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -55,6 +66,16 @@ def _safe_name(name: str) -> str:
         else:
             keep.append("_")
     return "".join(keep).strip("_") or "file"
+
+
+EXCLUDED_ATTACHMENT_KEYWORDS = ("신규조문", "신구조문")
+
+
+def _is_excluded_attachment(file_name: str) -> bool:
+    name = (file_name or "").strip().lower()
+    if not name:
+        return False
+    return any(keyword.lower() in name for keyword in EXCLUDED_ATTACHMENT_KEYWORDS)
 
 
 def _build_run_paths(run_id: str) -> RunPaths:
@@ -138,6 +159,7 @@ def collect_and_filter(
         "keep_count": rule.keep_count,
         "regulation_list": rule.regulation_list,
         "keep_source_urls": rule.keep_source_urls,
+        "keep_items": rule.keep_items,
     }
     _write_json(paths.interim / "02_latest_rule.json", rule_payload)
     write_log(
@@ -154,6 +176,7 @@ def collect_and_filter(
             "keep_count": llm.keep_count,
             "regulation_list": llm.regulation_list,
             "keep_source_urls": llm.keep_source_urls,
+            "keep_items": llm.keep_items,
         }
         _write_json(paths.interim / "03_latest_llm.json", llm_payload)
         write_log(
@@ -166,7 +189,7 @@ def collect_and_filter(
 
     keep_set = set(keep_urls)
     latest_board = [b for b in board if b.get("source_url", "") in keep_set]
-    selected = latest_board[: max(1, limit)]
+    selected = latest_board if limit <= 0 else latest_board[:limit]
     _write_json(paths.interim / "04_latest_selected_posts.json", selected)
     write_log(
         "latest_selected_posts",
@@ -184,19 +207,23 @@ def collect_and_filter(
         title = post.get("title", "")
         source_text = gw.fetch_source_text(source_url)
         attachments = gw.get_attachments(source_url)
+        kept_attachments = [a for a in attachments if not _is_excluded_attachment(a.file_name)]
+        skipped_file_names = [a.file_name for a in attachments if _is_excluded_attachment(a.file_name)]
         write_log(
             "post_collect_start",
             {
                 "index": idx,
                 "title": title,
                 "source_url": source_url,
-                "attachments": len(attachments),
+                "attachments": len(kept_attachments),
+                "attachments_skipped": len(skipped_file_names),
+                "skipped_file_names": skipped_file_names,
             },
             log_path=paths.log_file,
         )
 
         file_info: list[dict] = []
-        for att in attachments:
+        for att in kept_attachments:
             try:
                 raw_path = gw.download_file(att)
                 text, method = extract_text(raw_path)
@@ -339,6 +366,105 @@ def cleanup_run(paths: RunPaths) -> None:
             shutil.rmtree(target)
 
 
+def run_pipeline(options: PipelineOptions) -> dict:
+    run_id = options.run_id.strip() or _new_run_id()
+    paths = _build_run_paths(run_id)
+    started_at = _utc_now()
+    option_payload = {
+        "limit": options.limit,
+        "use_llm_filter": bool(options.use_llm_filter),
+        "cleanup_default_on": True,
+        "cleanup_enabled": bool(options.cleanup_enabled),
+        "weaviate_ingest_enabled": bool(options.ingest_weaviate),
+        "weaviate_class": options.weaviate_class,
+        "replace_own_collection": bool(options.replace_own_collection),
+    }
+    _write_manifest(paths, status="running", started_at=started_at, options=option_payload)
+    write_log(
+        "run_started",
+        {"run_id": run_id, "options": option_payload},
+        log_path=paths.log_file,
+    )
+
+    try:
+        docs = collect_and_filter(
+            paths=paths,
+            limit=options.limit,
+            use_llm_filter=options.use_llm_filter,
+        )
+        final_docs = summarize_docs(paths=paths, docs=docs)
+        ingest_report = {"input_count": 0, "error_count": 0}
+
+        if options.ingest_weaviate:
+            ensure_collection(
+                options.weaviate_class,
+                replace_own_collection=bool(options.replace_own_collection),
+                allowed_replace_classes=[PROJECT_WEAVIATE_CLASS],
+            )
+            ingest_report = upsert_documents(
+                class_name=options.weaviate_class,
+                run_id=run_id,
+                docs=final_docs,
+            )
+            _write_json(paths.result / "08_weaviate_ingest_report.json", ingest_report)
+            write_log(
+                "weaviate_ingest_done",
+                {
+                    "class_name": options.weaviate_class,
+                    "input_count": ingest_report.get("input_count", 0),
+                    "error_count": ingest_report.get("error_count", 0),
+                    "report": str(paths.result / "08_weaviate_ingest_report.json"),
+                },
+                log_path=paths.log_file,
+            )
+            if ingest_report.get("error_count", 0) > 0:
+                raise RuntimeError(
+                    f"weaviate ingest had errors: {ingest_report.get('error_count', 0)}"
+                )
+
+        cleaned = False
+        if options.cleanup_enabled:
+            cleanup_run(paths)
+            cleaned = True
+            write_log("cleanup_done", {"removed": ["raw", "parsed", "interim"]}, log_path=paths.log_file)
+
+        counts = {
+            "board_selected": len(docs),
+            "attachments": sum(len(d.get("file_info", [])) for d in docs),
+            "result_documents": len(final_docs),
+            "weaviate_ingested": ingest_report.get("input_count", 0),
+            "weaviate_error_count": ingest_report.get("error_count", 0),
+        }
+        _write_manifest(
+            paths,
+            status="success",
+            started_at=started_at,
+            finished_at=_utc_now(),
+            counts=counts,
+            options=option_payload,
+            cleanup_applied=cleaned,
+        )
+        return {
+            "run_id": run_id,
+            "run_root": str(paths.root),
+            "result_path": str(paths.result / "07_final_for_ingest.json"),
+            "log_path": str(paths.log_file),
+            "counts": counts,
+            "documents": final_docs,
+        }
+    except Exception as e:
+        _write_manifest(
+            paths,
+            status="failed",
+            started_at=started_at,
+            finished_at=_utc_now(),
+            options=option_payload,
+            error_summary=str(e),
+        )
+        write_log("run_failed", {"error": str(e)}, log_path=paths.log_file)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="run 기반 collect->filter->summarize 파이프라인")
     parser.add_argument("--limit", type=int, default=3, help="최신 필터 결과에서 처리할 게시글 수")
@@ -359,88 +485,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run_id = args.run_id.strip() or _new_run_id()
-    paths = _build_run_paths(run_id)
-    started_at = _utc_now()
-    options = {
-        "limit": args.limit,
-        "use_llm_filter": bool(args.use_llm_filter),
-        "cleanup_default_on": True,
-        "cleanup_enabled": not args.no_cleanup,
-        "weaviate_ingest_enabled": bool(args.ingest_weaviate),
-        "weaviate_class": args.weaviate_class,
-        "replace_own_collection": bool(args.replace_own_collection),
-    }
-    _write_manifest(paths, status="running", started_at=started_at, options=options)
-    write_log("run_started", {"run_id": run_id, "options": options}, log_path=paths.log_file)
-
-    try:
-        docs = collect_and_filter(paths=paths, limit=args.limit, use_llm_filter=args.use_llm_filter)
-        final_docs = summarize_docs(paths=paths, docs=docs)
-        ingest_report = {"input_count": 0, "error_count": 0}
-        if args.ingest_weaviate:
-            ensure_collection(
-                args.weaviate_class,
-                replace_own_collection=bool(args.replace_own_collection),
-                allowed_replace_classes=[PROJECT_WEAVIATE_CLASS],
-            )
-            ingest_report = upsert_documents(
-                class_name=args.weaviate_class,
-                run_id=run_id,
-                docs=final_docs,
-            )
-            _write_json(paths.result / "08_weaviate_ingest_report.json", ingest_report)
-            write_log(
-                "weaviate_ingest_done",
-                {
-                    "class_name": args.weaviate_class,
-                    "input_count": ingest_report.get("input_count", 0),
-                    "error_count": ingest_report.get("error_count", 0),
-                    "report": str(paths.result / "08_weaviate_ingest_report.json"),
-                },
-                log_path=paths.log_file,
-            )
-            if ingest_report.get("error_count", 0) > 0:
-                raise RuntimeError(
-                    f"weaviate ingest had errors: {ingest_report.get('error_count', 0)}"
-                )
-
-        cleaned = False
-        if not args.no_cleanup:
-            cleanup_run(paths)
-            cleaned = True
-            write_log("cleanup_done", {"removed": ["raw", "parsed", "interim"]}, log_path=paths.log_file)
-
-        counts = {
-            "board_selected": len(docs),
-            "attachments": sum(len(d.get("file_info", [])) for d in docs),
-            "result_documents": len(final_docs),
-            "weaviate_ingested": ingest_report.get("input_count", 0),
-            "weaviate_error_count": ingest_report.get("error_count", 0),
-        }
-        _write_manifest(
-            paths,
-            status="success",
-            started_at=started_at,
-            finished_at=_utc_now(),
-            counts=counts,
-            options=options,
-            cleanup_applied=cleaned,
+    result = run_pipeline(
+        PipelineOptions(
+            limit=args.limit,
+            run_id=args.run_id,
+            use_llm_filter=args.use_llm_filter,
+            cleanup_enabled=not args.no_cleanup,
+            ingest_weaviate=args.ingest_weaviate,
+            weaviate_class=args.weaviate_class,
+            replace_own_collection=args.replace_own_collection,
         )
-        print(f"run_root: {paths.root}")
-        print(f"result:   {paths.result / '07_final_for_ingest.json'}")
-        print(f"log:      {paths.log_file}")
-    except Exception as e:
-        _write_manifest(
-            paths,
-            status="failed",
-            started_at=started_at,
-            finished_at=_utc_now(),
-            options=options,
-            error_summary=str(e),
-        )
-        write_log("run_failed", {"error": str(e)}, log_path=paths.log_file)
-        raise
+    )
+    print(f"run_root: {result['run_root']}")
+    print(f"result:   {result['result_path']}")
+    print(f"log:      {result['log_path']}")
 
 
 if __name__ == "__main__":
