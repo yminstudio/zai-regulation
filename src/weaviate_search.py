@@ -133,7 +133,7 @@ def hybrid_search(
     limit: int = 30,
     class_name: str = PROJECT_WEAVIATE_CLASS,
     alpha: float = 0.35,
-    autocut: int = 3,
+    autocut: int = 2,
 ) -> SearchResult:
     query = (query or "").strip()
     if not query:
@@ -163,7 +163,7 @@ def search_with_fallback(
     limit: int = 30,
     class_name: str = PROJECT_WEAVIATE_CLASS,
     alpha: float = 0.35,
-    autocut: int = 3,
+    autocut: int = 2,
 ) -> SearchResult:
     """기본은 hybrid, 실패 시 vector fallback."""
     try:
