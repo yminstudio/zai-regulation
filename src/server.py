@@ -10,9 +10,13 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
 from src.chat_service import (
+    INTENT_NON_REGULATION_THRESHOLD,
+    NON_REGULATION_GUIDE_LINE,
     append_sq_comment,
+    classify_intent,
     choose_search_query,
     extract_current_user_question,
+    generate_non_regulation_answer,
     generate_answer_json,
 )
 from src.config import PROJECT_WEAVIATE_CLASS
@@ -20,6 +24,9 @@ from src.ingest_pipeline import PipelineOptions, run_pipeline
 from src.log_utils import write_log
 
 app = FastAPI(title="Regulation Ingest API", version="1.0.0")
+NON_REGULATION_FALLBACK_MESSAGE = (
+    f"사규 상담 전용 챗봇입니다. {NON_REGULATION_GUIDE_LINE}"
+)
 
 
 class IngestRequest(BaseModel):
@@ -114,6 +121,22 @@ def _stream_openai_delta(content: str, *, model: str) -> StreamingResponse:
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _chat_completion_payload(*, model: str, content: str) -> dict:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
 @app.post("/regulation/chat")
 def regulation_chat(req: ChatRequest):
     try:
@@ -121,6 +144,29 @@ def regulation_chat(req: ChatRequest):
         current_question = extract_current_user_question(messages)
         if not current_question:
             raise HTTPException(status_code=400, detail="no user question found in messages")
+
+        intent = classify_intent(current_question)
+        route = "regulation"
+        if intent.intent == "non_regulation" and intent.confidence >= INTENT_NON_REGULATION_THRESHOLD:
+            route = "non_regulation"
+
+        if route == "non_regulation":
+            fallback_answer = generate_non_regulation_answer(current_question)
+            write_log(
+                "chat_intent_routed",
+                {
+                    "question": current_question,
+                    "intent": intent.intent,
+                    "confidence": intent.confidence,
+                    "reason": intent.reason,
+                    "route": route,
+                    "fallback_answer_preview": fallback_answer[:160],
+                    "stream": req.stream,
+                },
+            )
+            if req.stream:
+                return _stream_openai_delta(fallback_answer, model=req.model)
+            return JSONResponse(_chat_completion_payload(model=req.model, content=fallback_answer))
 
         decision = choose_search_query(messages, current_question)
         out = generate_answer_json(
@@ -151,6 +197,10 @@ def regulation_chat(req: ChatRequest):
                 ],
                 "standalone_query": standalone_query,
                 "stream": req.stream,
+                "intent": intent.intent,
+                "intent_confidence": intent.confidence,
+                "intent_reason": intent.reason,
+                "route": route,
             },
         )
     except HTTPException:
@@ -161,18 +211,6 @@ def regulation_chat(req: ChatRequest):
     if req.stream:
         return _stream_openai_delta(assistant_content, model=req.model)
 
-    payload = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": assistant_content},
-                "finish_reason": "stop",
-            }
-        ],
-    }
+    payload = _chat_completion_payload(model=req.model, content=assistant_content)
     return JSONResponse(payload)
 

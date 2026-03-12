@@ -14,9 +14,11 @@ from src.weaviate_search import SearchHit, SearchResult, search_with_fallback
 SEARCH_FETCH_LIMIT = 30
 LOW_SCORE_THRESHOLD = 0.45
 RELATED_LINK_MAX_CANDIDATES = 5
+INTENT_NON_REGULATION_THRESHOLD = 0.8
+NON_REGULATION_GUIDE_LINE = "사내 규정/복리후생/휴가/경비 관련 질문을 주시면 도와드릴게요."
 
 SYSTEM_PROMPT = """
-당신은 KG그룹의 사내규정(사규) 검색 챗봇입니다.
+당신은 KG제로인의 사내규정(사규) 검색 챗봇입니다.
 아래에 검색된 사규 정보(제목, 요약, 일부 본문)가 제공됩니다.
 반드시 제공된 정보 범위 내에서만 판단하고 답변하세요.
 
@@ -59,8 +61,37 @@ SYSTEM_PROMPT = """
 }
 """.strip()
 
+INTENT_SYSTEM_PROMPT = """
+당신은 KG제로인 사규 챗봇의 선행 라우터입니다.
+입력 질문을 아래 2개 라벨 중 하나로 분류하세요.
+
+- regulation: 사내 규정/규칙/기준/복리후생/휴가/경비/지급/절차/대상/조건 등 사규 문의
+- non_regulation: 일상 대화, 잡담, 사규와 무관한 일반 질문
+
+중요 규칙:
+1) 애매하면 반드시 regulation으로 분류하세요. (보수 정책)
+2) 출력은 JSON object 한 개만 반환하세요.
+3) confidence는 0.0~1.0 사이 실수로 반환하세요.
+
+출력 스키마:
+{
+  "intent": "regulation | non_regulation",
+  "confidence": 0.0,
+  "reason": "짧은 근거"
+}
+""".strip()
+
+NON_REGULATION_SYSTEM_PROMPT = f"""
+당신은 KG제로인 사규 챗봇입니다.
+사규와 무관한 질문에 답할 때:
+1) 질문에 자연스럽게 1~2문장으로 답합니다.
+2) 마지막에 항상 이 문장을 추가합니다:
+   "{NON_REGULATION_GUIDE_LINE}"
+3) 모르는 내용은 솔직하게 모른다고 합니다.
+""".strip()
+
 LATEST_REWRITE_SYSTEM_PROMPT = """
-당신은 KG그룹 사규 챗봇입니다.
+당신은 KG제로인 사규 챗봇입니다.
 기존 답변에 과거 버전 규정 링크가 섞인 경우가 있어, 아래에 제공되는 최신 규정 근거로 답변을 다시 작성해야 합니다.
 
 [작성 규칙]
@@ -85,6 +116,13 @@ class QueryDecision:
     result: SearchResult
 
 
+@dataclass
+class IntentDecision:
+    intent: str
+    confidence: float
+    reason: str
+
+
 def _content_to_text(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -95,6 +133,74 @@ def _content_to_text(content: object) -> str:
                 out.append(str(part.get("text", "")))
         return "\n".join(out).strip()
     return ""
+
+
+def _clamp_confidence(value: object) -> float:
+    try:
+        num = float(value)
+    except Exception:
+        return 0.0
+    if num < 0.0:
+        return 0.0
+    if num > 1.0:
+        return 1.0
+    return num
+
+
+def classify_intent(question: str) -> IntentDecision:
+    q = (question or "").strip()
+    if not q:
+        return IntentDecision(intent="regulation", confidence=0.0, reason="empty_question")
+    if not OPENAI_API_KEY:
+        # 키가 없더라도 기본 라우팅은 regulation으로 유지
+        return IntentDecision(intent="regulation", confidence=0.0, reason="missing_api_key")
+
+    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
+    resp = client.chat.completions.create(
+        model=ANSWER_MODEL,
+        messages=[
+            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+            {"role": "user", "content": q},
+        ],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    parsed = _safe_json_loads(raw)
+    raw_intent = str(parsed.get("intent", "regulation")).strip().lower()
+    confidence = _clamp_confidence(parsed.get("confidence", 0.0))
+    reason = str(parsed.get("reason", "")).strip() or "no_reason"
+
+    intent = "non_regulation" if raw_intent == "non_regulation" else "regulation"
+    return IntentDecision(intent=intent, confidence=confidence, reason=reason)
+
+
+def generate_non_regulation_answer(question: str) -> str:
+    q = (question or "").strip()
+    if not q:
+        return NON_REGULATION_GUIDE_LINE
+    if not OPENAI_API_KEY:
+        return NON_REGULATION_GUIDE_LINE
+
+    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
+    try:
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[
+                {"role": "system", "content": NON_REGULATION_SYSTEM_PROMPT},
+                {"role": "user", "content": q},
+            ],
+            temperature=0.3,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        answer = ""
+
+    if not answer:
+        return NON_REGULATION_GUIDE_LINE
+    if NON_REGULATION_GUIDE_LINE not in answer:
+        answer = f"{answer}\n{NON_REGULATION_GUIDE_LINE}".strip()
+    return answer
 
 
 def extract_current_user_question(messages: list[dict]) -> str:
