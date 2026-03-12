@@ -17,6 +17,7 @@ from src.chat_service import (
 )
 from src.config import PROJECT_WEAVIATE_CLASS
 from src.ingest_pipeline import PipelineOptions, run_pipeline
+from src.log_utils import write_log
 
 app = FastAPI(title="Regulation Ingest API", version="1.0.0")
 
@@ -130,6 +131,28 @@ def regulation_chat(req: ChatRequest):
         answer = out.get("answer", "").strip()
         standalone_query = out.get("standalone_query", "").strip()
         assistant_content = append_sq_comment(answer, standalone_query)
+        write_log(
+            "chat_query_processed",
+            {
+                "question": current_question,
+                "chosen_query": decision.chosen_query,
+                "top_score": decision.score_a,
+                "search_mode": decision.result.mode,
+                "hit_count": len(decision.result.hits),
+                "top_hits": [
+                    {
+                        "rank": i + 1,
+                        "title": h.title,
+                        "reg_date": h.reg_date,
+                        "score": h.score,
+                        "source_url": h.source_url,
+                    }
+                    for i, h in enumerate(decision.result.hits[:5])
+                ],
+                "standalone_query": standalone_query,
+                "stream": req.stream,
+            },
+        )
     except HTTPException:
         raise
     except Exception as e:
