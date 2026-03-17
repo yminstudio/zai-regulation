@@ -137,12 +137,12 @@ def _chat(client: OpenAI, system: str, user: str) -> str:
     if not user.strip():
         return ""
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-nano",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.1,
+        # temperature=0.1,
     )
     return (resp.choices[0].message.content or "").strip()
 
