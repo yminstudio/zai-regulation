@@ -2,28 +2,29 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
 from src.chat_service import (
     INTENT_NON_REGULATION_THRESHOLD,
     NON_REGULATION_GUIDE_LINE,
-    append_sq_comment,
     classify_intent,
     choose_search_query,
     extract_current_user_question,
     generate_non_regulation_answer,
     generate_answer_json,
 )
-from src.config import PROJECT_WEAVIATE_CLASS
+from src.config import ANSWER_MODEL, PROJECT_WEAVIATE_CLASS
 from src.ingest_pipeline import PipelineOptions, run_pipeline
 from src.log_utils import write_log
 
 app = FastAPI(title="Regulation Ingest API", version="1.0.0")
+MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", "zai-regulation")
 NON_REGULATION_FALLBACK_MESSAGE = (
     f"사규 상담 전용 챗봇입니다. {NON_REGULATION_GUIDE_LINE}"
 )
@@ -44,7 +45,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4.1-nano"
     messages: list[ChatMessage]
     stream: bool = True
 
@@ -78,6 +79,23 @@ def regulation_ingest(req: IngestRequest) -> dict:
         "run_id": result.get("run_id"),
         "counts": result.get("counts", {}),
         "ingested_items": items,
+    }
+
+
+@app.get("/v1/models")
+def openai_models() -> dict:
+    """OpenAI 호환 모델 목록 엔드포인트."""
+    now = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL_DISPLAY_NAME,
+                "object": "model",
+                "created": now,
+                "owned_by": "zai-regulation",
+            }
+        ],
     }
 
 
@@ -138,7 +156,11 @@ def _chat_completion_payload(*, model: str, content: str) -> dict:
 
 
 @app.post("/regulation/chat")
-def regulation_chat(req: ChatRequest):
+@app.post("/v1/chat/completions")
+def regulation_chat(req: ChatRequest, request: Request):
+    # OpenWebUI(OpenAI 호환 경로)는 SSE를 기본 강제한다.
+    # /regulation/chat 경로는 기존 req.stream 플래그를 그대로 존중한다.
+    effective_stream = req.stream or request.url.path.startswith("/v1/")
     try:
         messages = [m.model_dump() for m in req.messages]
         current_question = extract_current_user_question(messages)
@@ -161,12 +183,12 @@ def regulation_chat(req: ChatRequest):
                     "reason": intent.reason,
                     "route": route,
                     "fallback_answer_preview": fallback_answer[:160],
-                    "stream": req.stream,
+                    "stream": effective_stream,
                 },
             )
-            if req.stream:
-                return _stream_openai_delta(fallback_answer, model=req.model)
-            return JSONResponse(_chat_completion_payload(model=req.model, content=fallback_answer))
+            if effective_stream:
+                return _stream_openai_delta(fallback_answer, model=MODEL_DISPLAY_NAME)
+            return JSONResponse(_chat_completion_payload(model=MODEL_DISPLAY_NAME, content=fallback_answer))
 
         decision = choose_search_query(messages, current_question)
         out = generate_answer_json(
@@ -176,7 +198,8 @@ def regulation_chat(req: ChatRequest):
         )
         answer = out.get("answer", "").strip()
         standalone_query = out.get("standalone_query", "").strip()
-        assistant_content = append_sq_comment(answer, standalone_query)
+        # 사용자 노출 응답에는 sq 주석을 포함하지 않는다.
+        assistant_content = answer
         write_log(
             "chat_query_processed",
             {
@@ -196,7 +219,7 @@ def regulation_chat(req: ChatRequest):
                     for i, h in enumerate(decision.result.hits[:5])
                 ],
                 "standalone_query": standalone_query,
-                "stream": req.stream,
+                "stream": effective_stream,
                 "intent": intent.intent,
                 "intent_confidence": intent.confidence,
                 "intent_reason": intent.reason,
@@ -208,9 +231,9 @@ def regulation_chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    if req.stream:
-        return _stream_openai_delta(assistant_content, model=req.model)
+    if effective_stream:
+        return _stream_openai_delta(assistant_content, model=MODEL_DISPLAY_NAME)
 
-    payload = _chat_completion_payload(model=req.model, content=assistant_content)
+    payload = _chat_completion_payload(model=MODEL_DISPLAY_NAME, content=assistant_content)
     return JSONResponse(payload)
 

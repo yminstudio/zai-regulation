@@ -395,7 +395,7 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.1,
+        # temperature=0.1,
         response_format={"type": "json_object"},
     )
     raw = (resp.choices[0].message.content or "").strip()
@@ -591,7 +591,7 @@ def _rewrite_answer_with_latest_sources_if_needed(
             {"role": "system", "content": LATEST_REWRITE_SYSTEM_PROMPT},
             {"role": "user", "content": rewrite_prompt},
         ],
-        temperature=0.1,
+        # temperature=0.1,
         response_format={"type": "json_object"},
     )
     raw = (resp.choices[0].message.content or "").strip()
