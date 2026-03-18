@@ -12,8 +12,10 @@ from src.config import ANSWER_MODEL, OPENAI_API_KEY
 from src.weaviate_search import SearchHit, SearchResult, search_with_fallback
 
 SEARCH_FETCH_LIMIT = 30
+ANSWER_CONTEXT_LIMIT = 10
 LOW_SCORE_THRESHOLD = 0.45
 RELATED_LINK_MAX_CANDIDATES = 5
+RELATED_LINK_APPEND_LIMIT = 3
 INTENT_NON_REGULATION_THRESHOLD = 0.8
 NON_REGULATION_GUIDE_LINE = "사내 규정/복리후생/휴가/경비 관련 질문을 주시면 도와드릴게요."
 
@@ -83,11 +85,15 @@ INTENT_SYSTEM_PROMPT = """
 
 NON_REGULATION_SYSTEM_PROMPT = f"""
 당신은 KG제로인 사규 챗봇입니다.
-사규와 무관한 질문에 답할 때:
-1) 질문에 자연스럽게 1~2문장으로 답합니다.
-2) 마지막에 항상 이 문장을 추가합니다:
+사규와 무관한 질문에도 친절하게 답하되, 챗봇의 역할 경계를 유지하세요.
+규칙:
+1) 답변은 한국어로, 자연스럽고 이해하기 쉽게 2~5문장으로 작성합니다.
+2) 일반 상식/일상 질문은 간단히 도움되는 답변을 제공합니다.
+3) 불확실한 내용은 단정하지 말고, 가능한 범위에서만 안내합니다.
+4) 법률/노무/세무/의학 등 전문 판단이 필요한 질문은 일반 안내만 제공합니다.
+5) 사규 관련 질문으로 이어질 수 있으면 한 문장으로 부드럽게 유도합니다.
+6) 답변 마지막에 반드시 아래 문장을 그대로 추가합니다.
    "{NON_REGULATION_GUIDE_LINE}"
-3) 모르는 내용은 솔직하게 모른다고 합니다.
 """.strip()
 
 LATEST_REWRITE_SYSTEM_PROMPT = """
@@ -100,7 +106,9 @@ LATEST_REWRITE_SYSTEM_PROMPT = """
 3. 기존 답변의 구조를 최대한 유지하되, 과거 기준 내용은 최신 기준으로 교체하세요.
 4. 링크는 반드시 최신 규정 링크를 사용하세요.
 5. 근거가 부족하면 단정하지 말고 "관련 가능성"으로 표현하세요.
-6. 출력은 반드시 JSON object 한 개:
+6. 링크를 출력할 때는 반드시 아래 마크다운 형식을 사용하세요.
+   - [관련링크 : 규정명](링크URL)
+7. 출력은 반드시 JSON object 한 개:
 {
   "answer": "사용자에게 보여줄 최종 답변"
 }
@@ -235,14 +243,16 @@ def _query_terms(query: str) -> set[str]:
     return {t.lower() for t in re.findall(r"[0-9A-Za-z가-힣]+", (query or "").strip()) if t}
 
 
-def _keyword_match_boost(query_terms: set[str], title: str, keywords: list[str]) -> float:
+def _keyword_match_boost(query_terms: set[str], title: str, keywords: list[str], summary_text: str) -> float:
     if not query_terms:
         return 0.0
     title_text = (title or "").lower()
     keywords_text = " ".join(keywords or []).lower()
+    summary = (summary_text or "").lower()
     title_hits = sum(1 for term in query_terms if term and term in title_text)
     keyword_hits = sum(1 for term in query_terms if term and term in keywords_text)
-    return min(title_hits * 0.12, 0.36) + min(keyword_hits * 0.08, 0.24)
+    summary_hits = sum(1 for term in query_terms if term and term in summary)
+    return min(title_hits * 0.14, 0.42) + min(keyword_hits * 0.1, 0.3) + min(summary_hits * 0.06, 0.18)
 
 
 def _rerank_hits_by_last_query(result: SearchResult, query: str) -> SearchResult:
@@ -267,7 +277,12 @@ def _rerank_hits_by_last_query(result: SearchResult, query: str) -> SearchResult
 
     scored: list[tuple[float, int]] = []
     for idx, hit in enumerate(hits):
-        boost = _keyword_match_boost(query_terms, hit.title, hit.summary_keywords) + recency_boost(idx)
+        boost = _keyword_match_boost(
+            query_terms,
+            hit.title,
+            hit.summary_keywords,
+            hit.summary_text,
+        ) + recency_boost(idx)
         final_score = float(hit.score) + boost
         scored.append((final_score, idx))
 
@@ -332,6 +347,36 @@ def _build_context_from_hits(hits: list[SearchHit]) -> str:
     return "\n\n".join(rows)
 
 
+def _select_answer_context_hits(hits: list[SearchHit], query: str, *, limit: int = ANSWER_CONTEXT_LIMIT) -> list[SearchHit]:
+    """답변용 컨텍스트를 축소하되, 질의 매칭 문서에 가중치를 준다."""
+    if not hits:
+        return []
+
+    cap_size = max(max(1, limit), min(len(hits), max(1, limit) * 3))
+    candidate_hits = hits[:cap_size]
+    query_terms = _query_terms(query)
+    if not query_terms:
+        return candidate_hits[: max(1, limit)]
+
+    weighted: list[tuple[float, int, SearchHit]] = []
+    for idx, hit in enumerate(candidate_hits):
+        title_kw_text = " ".join(
+            [
+                hit.title or "",
+                " ".join(str(k) for k in (hit.summary_keywords or [])),
+            ]
+        ).lower()
+        summary_text = (hit.summary_text or "").lower()
+        title_kw_hits = sum(1 for term in query_terms if term and term in title_kw_text)
+        summary_hits = sum(1 for term in query_terms if term and term in summary_text)
+        # 완전 필터링 대신 매칭 문서 가중치만 크게 부여해 연관 문서를 함께 유지한다.
+        match_boost = min(title_kw_hits * 0.45, 1.2) + min(summary_hits * 0.2, 0.6)
+        weighted.append((float(hit.score) + match_boost, idx, hit))
+
+    weighted.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    return [hit for _, _, hit in weighted[: max(1, limit)]]
+
+
 def _search_with_low_score_fallback(query: str) -> SearchResult:
     result = search_with_fallback(query, limit=SEARCH_FETCH_LIMIT)
     if result.top_score >= LOW_SCORE_THRESHOLD:
@@ -379,7 +424,17 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
         raise RuntimeError("OPENAI_API_KEY is missing")
     client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
 
-    context_text = _build_context(decision.result)
+    answer_context_hits = _select_answer_context_hits(
+        decision.result.hits,
+        current_question,
+        limit=ANSWER_CONTEXT_LIMIT,
+    )
+    answer_context_result = SearchResult(
+        query=decision.result.query,
+        hits=answer_context_hits,
+        mode=decision.result.mode,
+    )
+    context_text = _build_context(answer_context_result)
     history_text = _messages_to_history(messages)
     user_prompt = (
         f"[검색에 사용된 질의]\n{decision.chosen_query}\n\n"
@@ -701,19 +756,10 @@ def _append_related_links_if_needed(answer: str, *, decision: QueryDecision, cur
     if not missing:
         return answer
 
-    latest_dt = None
-    for h in candidates:
-        dt = _parse_reg_date(h.reg_date)
-        if dt is not None and (latest_dt is None or dt > latest_dt):
-            latest_dt = dt
-
+    missing = missing[:RELATED_LINK_APPEND_LIMIT]
     lines = [answer.strip(), "", "추가로 확인할 관련 규정:"]
     for h in missing:
-        label = h.title
-        dt = _parse_reg_date(h.reg_date)
-        if latest_dt is not None and dt is not None and dt == latest_dt:
-            label = f"{label} [최신]"
-        lines.append(f"- [관련링크 : {label}]({h.source_url})")
+        lines.append(f"- [관련링크 : {h.title}]({h.source_url})")
     return "\n".join(lines).strip()
 
 
