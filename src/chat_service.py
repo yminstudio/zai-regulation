@@ -83,6 +83,24 @@ INTENT_SYSTEM_PROMPT = """
 }
 """.strip()
 
+KEYWORD_EXTRACT_SYSTEM_PROMPT = """
+당신은 KG제로인 사규 검색용 키워드 추출기입니다.
+사용자 질문에서 "규정 검색 정확도"에 가장 중요한 핵심어만 고르세요.
+
+규칙:
+1) 질문의 주변 맥락어(예: 우리, 회사, 나는, 이거, 좀)는 제외합니다.
+2) 규정 탐색에 직접 쓰일 실질 키워드만 2~5개 반환합니다.
+3) 한 단어 위주로 간결하게 반환합니다. (필요시 2어절까지 허용)
+4) 애매하면 복리후생/휴가/경비/지급/대상/조건/절차 관련 핵심어를 우선합니다.
+5) 출력은 JSON object 한 개만 반환합니다.
+
+출력 스키마:
+{
+  "keywords": ["키워드1", "키워드2"],
+  "reason": "짧은 근거"
+}
+""".strip()
+
 NON_REGULATION_SYSTEM_PROMPT = f"""
 당신은 KG제로인 사규 챗봇입니다.
 사규와 무관한 질문에도 친절하게 답하되, 챗봇의 역할 경계를 유지하세요.
@@ -118,16 +136,31 @@ LATEST_REWRITE_SYSTEM_PROMPT = """
 @dataclass
 class QueryDecision:
     chosen_query: str
+    normalized_query: str
     score_a: float
     score_b: float
     tie_break_reason: str
     result: SearchResult
+    extracted_keywords: list[str]
+    search_queries: list[str]
+    raw_extracted_keywords: list[str]
+    keyword_source: str
+    keyword_reason: str
+    rerank_query: str
 
 
 @dataclass
 class IntentDecision:
     intent: str
     confidence: float
+    reason: str
+
+
+@dataclass
+class KeywordExtractionDecision:
+    raw_keywords: list[str]
+    cleaned_keywords: list[str]
+    source: str
     reason: str
 
 
@@ -159,6 +192,9 @@ def classify_intent(question: str) -> IntentDecision:
     q = (question or "").strip()
     if not q:
         return IntentDecision(intent="regulation", confidence=0.0, reason="empty_question")
+    if _is_meta_task_prompt(q):
+        # OpenWebUI 보조 태스크 프롬프트는 사규 검색 파이프라인에서 제외한다.
+        return IntentDecision(intent="non_regulation", confidence=1.0, reason="meta_task_prompt_guard")
     if not OPENAI_API_KEY:
         # 키가 없더라도 기본 라우팅은 regulation으로 유지
         return IntentDecision(intent="regulation", confidence=0.0, reason="missing_api_key")
@@ -241,6 +277,245 @@ def _parse_reg_date(value: str) -> datetime | None:
 
 def _query_terms(query: str) -> set[str]:
     return {t.lower() for t in re.findall(r"[0-9A-Za-z가-힣]+", (query or "").strip()) if t}
+
+
+def _strip_embedded_chat_history(text: str) -> str:
+    src = (text or "").strip()
+    if not src:
+        return ""
+    # 메타 프롬프트에 내장된 chat_history 블록은 현재 질의로 간주하지 않는다.
+    src = re.sub(r"<chat_history>.*?</chat_history>", " ", src, flags=re.IGNORECASE | re.DOTALL)
+    src = re.sub(r"\s+", " ", src).strip()
+    return src
+
+
+def _is_meta_task_prompt(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    markers = (
+        "### task:",
+        "<chat_history>",
+        "json format:",
+        "\"follow_ups\"",
+        "\"title\"",
+        "\"tags\"",
+        "summarizing the chat history",
+        "based on the chat history",
+    )
+    return any(marker in q for marker in markers)
+
+
+def _sanitize_keywords(values: list[str], *, max_keywords: int = 5) -> list[str]:
+    stopwords = {
+        "나",
+        "내",
+        "저",
+        "우리",
+        "회사",
+        "사내",
+        "질문",
+        "문의",
+        "관련",
+        "내용",
+        "이거",
+        "이것",
+        "저거",
+        "그거",
+        "가능",
+        "여부",
+        "지금",
+        "오늘",
+        "이번",
+        "그냥",
+        "둘",
+        "다",
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        norm = " ".join(re.findall(r"[0-9A-Za-z가-힣]+", text))
+        if not norm:
+            continue
+        key = norm.lower()
+        if len(key) <= 1:
+            continue
+        if key in stopwords:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+        if len(out) >= max(1, max_keywords):
+            break
+    return out
+
+
+def _heuristic_regulation_keywords(question: str, *, max_keywords: int = 5) -> list[str]:
+    q = (question or "").strip()
+    if not q:
+        return []
+    terms = re.findall(r"[0-9A-Za-z가-힣]{2,}", q)
+    if not terms:
+        return []
+
+    priority_seeds = (
+        "결혼",
+        "경조",
+        "가족",
+        "부부",
+        "출산",
+        "육아",
+        "휴가",
+        "복리",
+        "복리후생",
+        "경비",
+        "비용",
+        "지급",
+        "수당",
+        "지원",
+        "한도",
+        "금액",
+        "대상",
+        "조건",
+        "요건",
+        "신청",
+        "절차",
+        "승인",
+    )
+    first_pos: dict[str, int] = {}
+    for idx, t in enumerate(terms):
+        low = t.lower()
+        if low not in first_pos:
+            first_pos[low] = idx
+
+    scored: list[tuple[int, int, str]] = []
+    for token in {t.lower() for t in terms}:
+        score = 1
+        if any(seed in token for seed in priority_seeds):
+            score += 3
+        if token.endswith(("비", "금", "료", "당")):
+            score += 1
+        scored.append((score, -first_pos.get(token, 0), token))
+    scored.sort(reverse=True)
+
+    ordered = [token for _, _, token in scored]
+    return _sanitize_keywords(ordered, max_keywords=max_keywords)
+
+
+def extract_regulation_keywords(question: str, *, max_keywords: int = 5) -> KeywordExtractionDecision:
+    q = _strip_embedded_chat_history(question)
+    if not q:
+        return KeywordExtractionDecision(
+            raw_keywords=[],
+            cleaned_keywords=[],
+            source="empty_question",
+            reason="empty_question",
+        )
+    if not OPENAI_API_KEY:
+        heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
+        return KeywordExtractionDecision(
+            raw_keywords=heuristic,
+            cleaned_keywords=heuristic,
+            source="heuristic_missing_api_key",
+            reason="missing_api_key",
+        )
+
+    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
+    llm_reason = "no_reason"
+    llm_raw_keywords: list[str] = []
+    try:
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[
+                {"role": "system", "content": KEYWORD_EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": q},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _safe_json_loads(raw)
+        llm_reason = str(parsed.get("reason", "")).strip() or "no_reason"
+        keywords_raw = parsed.get("keywords", [])
+        if isinstance(keywords_raw, list):
+            llm_raw_keywords = [str(x or "").strip() for x in keywords_raw if str(x or "").strip()]
+            cleaned = _sanitize_keywords(keywords_raw, max_keywords=max_keywords)
+            if cleaned:
+                return KeywordExtractionDecision(
+                    raw_keywords=llm_raw_keywords,
+                    cleaned_keywords=cleaned,
+                    source="llm",
+                    reason=llm_reason,
+                )
+    except Exception as e:
+        llm_reason = f"llm_error:{type(e).__name__}"
+    heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
+    return KeywordExtractionDecision(
+        raw_keywords=llm_raw_keywords or heuristic,
+        cleaned_keywords=heuristic,
+        source="heuristic_llm_fallback",
+        reason=llm_reason,
+    )
+
+
+def _build_search_queries(current_question: str, extracted_keywords: list[str]) -> list[str]:
+    q = _strip_embedded_chat_history(current_question)
+    if not q:
+        return []
+    out = [q]
+    keywords = _sanitize_keywords(extracted_keywords, max_keywords=5)
+    if not keywords:
+        return out
+
+    joined = " ".join(keywords)
+    out.append(joined)
+    for kw in keywords[:3]:
+        out.append(f"{kw} 규정")
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in out:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item.strip())
+    return unique
+
+
+def _merge_multi_query_results(results: list[SearchResult]) -> SearchResult:
+    if not results:
+        return SearchResult(query="", hits=[], mode="hybrid_multi")
+
+    merged: dict[str, SearchHit] = {}
+    seen_count: dict[str, int] = {}
+    best_rank: dict[str, int] = {}
+    query_weights = [1.0, 0.97, 0.95, 0.93, 0.91]
+
+    for ridx, result in enumerate(results):
+        q_weight = query_weights[ridx] if ridx < len(query_weights) else 0.9
+        for rank, hit in enumerate(result.hits):
+            key = hit.source_url or hit.original_id or f"{hit.title}|{hit.reg_date}"
+            seen_count[key] = seen_count.get(key, 0) + 1
+            best_rank[key] = min(best_rank.get(key, rank), rank)
+            weighted_score = float(hit.score) * q_weight
+            existing = merged.get(key)
+            if existing is None or weighted_score > float(existing.score):
+                merged[key] = replace(hit, score=weighted_score)
+
+    final_hits: list[SearchHit] = []
+    for key, hit in merged.items():
+        occurrences = seen_count.get(key, 1)
+        rank_bonus = max(0.0, 0.08 - (best_rank.get(key, 0) * 0.004))
+        final_score = float(hit.score) + min((occurrences - 1) * 0.06, 0.18) + rank_bonus
+        final_hits.append(replace(hit, score=final_score))
+
+    final_hits.sort(key=lambda h: float(h.score), reverse=True)
+    merged_query = " || ".join(r.query for r in results if r.query)
+    return SearchResult(query=merged_query, hits=final_hits, mode="hybrid_multi")
 
 
 def _keyword_match_boost(query_terms: set[str], title: str, keywords: list[str], summary_text: str) -> float:
@@ -390,9 +665,15 @@ def _search_with_low_score_fallback(query: str) -> SearchResult:
 
 
 def choose_search_query(messages: list[dict], current_question: str) -> QueryDecision:
-    # 검색 질의는 항상 마지막 유저 질문 1개를 사용한다.
-    raw_result = _search_with_low_score_fallback(current_question)
-    reranked_result = _rerank_hits_by_last_query(raw_result, current_question)
+    normalized_question = _strip_embedded_chat_history(current_question)
+    # regulation 라우트에서는 "원문 + 핵심 키워드" 멀티 검색을 수행한다.
+    keyword_decision = extract_regulation_keywords(normalized_question, max_keywords=5)
+    extracted_keywords = keyword_decision.cleaned_keywords
+    search_queries = _build_search_queries(normalized_question, extracted_keywords)
+    raw_results = [_search_with_low_score_fallback(q) for q in search_queries] if search_queries else []
+    merged_result = _merge_multi_query_results(raw_results)
+    rerank_query = " ".join(extracted_keywords) if extracted_keywords else normalized_question
+    reranked_result = _rerank_hits_by_last_query(merged_result, rerank_query)
     # 최종 rank는 리랭킹 score 기준을 우선한다.
     final_result = SearchResult(
         query=reranked_result.query,
@@ -401,10 +682,17 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
     )
     return QueryDecision(
         chosen_query=current_question,
+        normalized_query=normalized_question,
         score_a=final_result.top_score,
         score_b=0.0,
-        tie_break_reason="last_user_query_rerank_score_first",
+        tie_break_reason="multi_query_keyword_rerank_score_first",
         result=final_result,
+        extracted_keywords=extracted_keywords,
+        search_queries=search_queries or [normalized_question],
+        raw_extracted_keywords=keyword_decision.raw_keywords,
+        keyword_source=keyword_decision.source,
+        keyword_reason=keyword_decision.reason,
+        rerank_query=rerank_query,
     )
 
 
@@ -424,9 +712,10 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
         raise RuntimeError("OPENAI_API_KEY is missing")
     client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
 
+    context_query = " ".join(decision.extracted_keywords) if decision.extracted_keywords else decision.normalized_query
     answer_context_hits = _select_answer_context_hits(
         decision.result.hits,
-        current_question,
+        context_query,
         limit=ANSWER_CONTEXT_LIMIT,
     )
     answer_context_result = SearchResult(
@@ -438,6 +727,8 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
     history_text = _messages_to_history(messages)
     user_prompt = (
         f"[검색에 사용된 질의]\n{decision.chosen_query}\n\n"
+        f"[추출 키워드]\n{', '.join(decision.extracted_keywords) if decision.extracted_keywords else '없음'}\n\n"
+        f"[멀티 검색 질의]\n" + "\n".join(f"- {q}" for q in decision.search_queries) + "\n\n"
         f"[검색 점수]\nscore_A={decision.score_a:.4f}, score_B={decision.score_b:.4f}\n"
         f"decision={decision.tie_break_reason}\n\n"
         f"[검색 컨텍스트]\n{context_text}\n\n"

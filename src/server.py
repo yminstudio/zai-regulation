@@ -205,6 +205,13 @@ def regulation_chat(req: ChatRequest, request: Request):
             {
                 "question": current_question,
                 "chosen_query": decision.chosen_query,
+                "normalized_query": decision.normalized_query,
+                "raw_extracted_keywords": decision.raw_extracted_keywords,
+                "extracted_keywords": decision.extracted_keywords,
+                "keyword_source": decision.keyword_source,
+                "keyword_reason": decision.keyword_reason,
+                "search_queries": decision.search_queries,
+                "rerank_query": decision.rerank_query,
                 "top_score": decision.score_a,
                 "search_mode": decision.result.mode,
                 "hit_count": len(decision.result.hits),
