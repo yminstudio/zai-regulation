@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 
@@ -18,6 +19,9 @@ from src.chat_service import (
     extract_current_user_question,
     generate_non_regulation_answer,
     generate_answer_json,
+    has_regulation_hints,
+    is_meta_task_prompt,
+    should_topic_lock,
 )
 from src.config import ANSWER_MODEL, PROJECT_WEAVIATE_CLASS
 from src.ingest_pipeline import PipelineOptions, run_pipeline
@@ -48,6 +52,21 @@ class ChatRequest(BaseModel):
     model: str = "gpt-4.1-nano"
     messages: list[ChatMessage]
     stream: bool = True
+    use_llm_selector: bool = True
+    shadow_compare: bool = False
+
+
+def _extract_link_urls(text: str) -> list[str]:
+    link_re = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    urls: list[str] = []
+    seen: set[str] = set()
+    for m in link_re.finditer(text or ""):
+        url = m.group(1).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
 
 
 @app.post("/regulation/ingest")
@@ -158,9 +177,8 @@ def _chat_completion_payload(*, model: str, content: str) -> dict:
 @app.post("/regulation/chat")
 @app.post("/v1/chat/completions")
 def regulation_chat(req: ChatRequest, request: Request):
-    # OpenWebUI(OpenAI 호환 경로)는 SSE를 기본 강제한다.
-    # /regulation/chat 경로는 기존 req.stream 플래그를 그대로 존중한다.
-    effective_stream = req.stream or request.url.path.startswith("/v1/")
+    # 스트리밍 여부는 요청의 stream 플래그를 그대로 따른다.
+    effective_stream = req.stream
     try:
         messages = [m.model_dump() for m in req.messages]
         current_question = extract_current_user_question(messages)
@@ -168,8 +186,16 @@ def regulation_chat(req: ChatRequest, request: Request):
             raise HTTPException(status_code=400, detail="no user question found in messages")
 
         intent = classify_intent(current_question)
+        topic_lock = should_topic_lock(messages, current_question)
+        meta_task = is_meta_task_prompt(current_question) or intent.reason == "meta_task_prompt_guard"
+        regulation_hint_override = (not meta_task) and has_regulation_hints(current_question)
         route = "regulation"
-        if intent.intent == "non_regulation" and intent.confidence >= INTENT_NON_REGULATION_THRESHOLD:
+        if (
+            intent.intent == "non_regulation"
+            and intent.confidence >= INTENT_NON_REGULATION_THRESHOLD
+            and not topic_lock
+            and not regulation_hint_override
+        ):
             route = "non_regulation"
 
         if route == "non_regulation":
@@ -181,6 +207,9 @@ def regulation_chat(req: ChatRequest, request: Request):
                     "intent": intent.intent,
                     "confidence": intent.confidence,
                     "reason": intent.reason,
+                    "meta_task": meta_task,
+                    "topic_lock": topic_lock,
+                    "regulation_hint_override": regulation_hint_override,
                     "route": route,
                     "fallback_answer_preview": fallback_answer[:160],
                     "stream": effective_stream,
@@ -195,9 +224,11 @@ def regulation_chat(req: ChatRequest, request: Request):
             messages=messages,
             current_question=current_question,
             decision=decision,
+            use_llm_selector=req.use_llm_selector,
         )
         answer = out.get("answer", "").strip()
         standalone_query = out.get("standalone_query", "").strip()
+        answer_links = _extract_link_urls(answer)
         # 사용자 노출 응답에는 sq 주석을 포함하지 않는다.
         assistant_content = answer
         write_log(
@@ -215,6 +246,15 @@ def regulation_chat(req: ChatRequest, request: Request):
                 "top_score": decision.score_a,
                 "search_mode": decision.result.mode,
                 "hit_count": len(decision.result.hits),
+                "request_modes": {
+                    "use_multi_query": False,
+                    "use_llm_selector": req.use_llm_selector,
+                    "shadow_compare": req.shadow_compare,
+                },
+                "search_debug": decision.debug,
+                "selector_debug": out.get("debug", {}),
+                "answer_link_count": len(answer_links),
+                "answer_links": answer_links,
                 "top_hits": [
                     {
                         "rank": i + 1,
@@ -230,9 +270,59 @@ def regulation_chat(req: ChatRequest, request: Request):
                 "intent": intent.intent,
                 "intent_confidence": intent.confidence,
                 "intent_reason": intent.reason,
+                "meta_task": meta_task,
+                "topic_lock": topic_lock,
+                "regulation_hint_override": regulation_hint_override,
                 "route": route,
             },
         )
+
+        if req.shadow_compare:
+            shadow_cases = [
+                {"name": "selector_on", "use_llm_selector": True},
+                {"name": "selector_off", "use_llm_selector": False},
+            ]
+            shadow_results: list[dict] = []
+            for case in shadow_cases:
+                if case["use_llm_selector"] == req.use_llm_selector:
+                    continue
+                d = choose_search_query(messages, current_question)
+                o = generate_answer_json(
+                    messages=messages,
+                    current_question=current_question,
+                    decision=d,
+                    use_llm_selector=case["use_llm_selector"],
+                )
+                candidate_answer = str(o.get("answer", "")).strip()
+                candidate_links = _extract_link_urls(candidate_answer)
+                shadow_results.append(
+                    {
+                        "name": case["name"],
+                        "use_multi_query": False,
+                        "use_llm_selector": case["use_llm_selector"],
+                        "top_score": d.score_a,
+                        "search_queries": d.search_queries,
+                        "search_debug": d.debug,
+                        "selector_debug": o.get("debug", {}),
+                        "answer_preview": candidate_answer[:220],
+                        "answer_link_count": len(candidate_links),
+                        "answer_links": candidate_links,
+                    }
+                )
+            write_log(
+                "chat_shadow_compare",
+                {
+                    "question": current_question,
+                    "primary_modes": {
+                        "use_multi_query": False,
+                        "use_llm_selector": req.use_llm_selector,
+                    },
+                    "primary_top_score": decision.score_a,
+                    "primary_answer_link_count": len(answer_links),
+                    "primary_answer_links": answer_links,
+                    "comparisons": shadow_results,
+                },
+            )
     except HTTPException:
         raise
     except Exception as e:

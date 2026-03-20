@@ -43,6 +43,26 @@ def _get_schema_classes() -> list[str]:
     return [c.get("class", "") for c in classes if c.get("class")]
 
 
+def _get_class_properties(class_name: str) -> set[str]:
+    resp = _wv_request("GET", f"/v1/schema/{class_name}")
+    if resp.status_code != 200:
+        return set()
+    data = resp.json() or {}
+    props = data.get("properties", []) or []
+    return {str(p.get("name", "")).strip() for p in props if str(p.get("name", "")).strip()}
+
+
+def _ensure_class_properties(class_name: str, properties: list[dict]) -> None:
+    existing = _get_class_properties(class_name)
+    for prop in properties:
+        name = str(prop.get("name", "")).strip()
+        if not name or name in existing:
+            continue
+        resp = _wv_request("POST", f"/v1/schema/{class_name}/properties", payload=prop)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"add schema property failed ({name}): {resp.status_code} {resp.text}")
+
+
 def _create_schema(class_name: str) -> None:
     schema = {
         "class": class_name,
@@ -59,6 +79,7 @@ def _create_schema(class_name: str) -> None:
             {"name": "file_info_json", "dataType": ["text"]},
             {"name": "summary_text", "dataType": ["text"]},
             {"name": "summary_keywords", "dataType": ["text[]"]},
+            {"name": "rule_names", "dataType": ["text[]"]},
             {"name": "embedding_text", "dataType": ["text"]},
             {"name": "run_id", "dataType": ["text"]},
             {"name": "ingested_at", "dataType": ["date"]},
@@ -90,14 +111,39 @@ def ensure_collection(
         exists = False
     if not exists:
         _create_schema(class_name)
+    _ensure_class_properties(
+        class_name,
+        properties=[
+            {"name": "rule_names", "dataType": ["text[]"]},
+        ],
+    )
+
+
+def _extract_rule_names(title: str) -> list[str]:
+    raw = re.findall(r"[0-9A-Za-z가-힣]+(?:규정|규칙|부칙|기준|방침|준칙|정책|지침|제정)", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in raw:
+        item = r.strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def _build_embedding_text(doc: dict) -> str:
     title = (doc.get("title") or "").strip()
     summary_text = (doc.get("summary_text") or "").strip()
     kws = [k.strip() for k in (doc.get("summary_keywords") or []) if str(k).strip()]
+    rule_names = _extract_rule_names(title)
     kw_text = ", ".join(kws)
     parts = [title, summary_text]
+    if rule_names:
+        parts.append(f"규정명: {', '.join(rule_names)}")
     if kw_text:
         parts.append(f"키워드: {kw_text}")
     return "\n".join([p for p in parts if p]).strip()
@@ -151,6 +197,7 @@ def upsert_documents(
             "file_info_json": json.dumps(doc.get("file_info", []), ensure_ascii=False),
             "summary_text": doc.get("summary_text", ""),
             "summary_keywords": doc.get("summary_keywords", []),
+            "rule_names": _extract_rule_names(str(doc.get("title", ""))),
             "embedding_text": emb_text,
             "run_id": run_id,
             "ingested_at": _utc_now(),

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from openai import OpenAI
@@ -18,48 +18,35 @@ RELATED_LINK_MAX_CANDIDATES = 5
 RELATED_LINK_APPEND_LIMIT = 3
 INTENT_NON_REGULATION_THRESHOLD = 0.8
 NON_REGULATION_GUIDE_LINE = "사내 규정/복리후생/휴가/경비 관련 질문을 주시면 도와드릴게요."
+TOPIC_LOCK_MAX_USER_TURNS = 3
 
 SYSTEM_PROMPT = """
-당신은 KG제로인의 사내규정(사규) 검색 챗봇입니다.
-아래에 검색된 사규 정보(제목, 요약, 일부 본문)가 제공됩니다.
-반드시 제공된 정보 범위 내에서만 판단하고 답변하세요.
+당신은 KG제로인의 사내규정(사규) 링크 추천 챗봇입니다.
+목표는 장문 답변이 아니라 "정확한 관련 링크 선택"입니다.
+아래 candidate_docs는 검색 시스템이 뽑은 후보이며, id/title/reg_date/summary/keywords/url이 포함됩니다.
 
-[답변 원칙]
+[절대 규칙]
+1. candidate_docs에 없는 문서를 만들지 마세요.
+2. URL은 절대 생성/수정/추측하지 마세요. (id 선택만 수행)
+3. 출력은 반드시 JSON object 한 개만 반환하세요.
+4. selected_ids에는 반드시 candidate_docs의 id만 넣으세요.
+5. 관련 문서가 있으면 2~3개를 우선 선택하세요. (최대 3개)
+6. 동일 규정군(개정본/유사 제목)이 겹치면 최신 reg_date 문서를 우선 선택하세요.
+7. 확정적 근거가 부족하면 brief에 "관련 가능성"을 명시하세요.
+8. 질문과 명확히 무관하면 no_match=true로 반환하세요.
+9. brief는 "의도 추출 안내" 1문장만 작성하세요. (정답형 설명/해설 금지)
+10. 사용자의 질문에 대한 직접 답변(정책 해석, 결론 제시)을 작성하지 마세요.
 
-1. 검색 결과에 질문과 직접적으로 관련된 규정이 2개 이상이면 핵심 내용을 비교 요약하고 관련 링크를 모두 제시하세요.
-2. 검색 결과에 질문과 완전히 동일한 문구는 없더라도, 제목/요약/본문 맥락상 질문과 높은 관련성이 있다면
-   "직접적인 명시 규정은 없으나, 다음 규정이 관련 가능성이 있습니다."라고 안내하고 관련 링크를 2개 이상 제시하세요.
-3. 추측성 세부 내용은 작성하지 마세요. 반드시 검색 결과에 포함된 정보만 근거로 판단하세요.
-4. 숫자(금액), 퍼센트(%), 기한(일수), 조건은 그대로 유지하세요.
-5. 일반 원칙과 예외 규정이 함께 존재하면 반드시 함께 안내하세요.
-6. 반드시 한국어로 작성하세요.
-7. 질문과 무관한 규정은 포함하지 마세요.
-8. 링크는 반드시 마크다운 하이퍼링크 형식으로 작성하세요.
-9. 동일 문서에서 여러 항목을 답변할 경우 링크는 한 번만 정리하세요.
-10. 확정되지 않은 경우에는 "관련 가능성이 있는 규정"이라는 표현을 사용하세요.
-11. "관련 사규를 찾지 못했습니다."라는 문장은 검색 결과 전체가 질문과 명확히 무관할 때에만 사용하세요.
-12. 관련 문서가 여러 개면 최신 `reg_date` 문서를 먼저 안내하되, 다른 관련 문서도 생략하지 마세요.
-
-[응답 형식]
-① 질문에 직접적인 규정이 존재하는 경우:
-- (핵심 내용 요약)
-- (필요 시 조건/예외 안내)
-- [관련링크 : 규정명](링크URL)
-
-② 직접 규정은 없으나, 제목/요약상 높은 관련성이 있는 경우:
-- 질문에 대해 직접적으로 명시된 조항은 확인되지 않았습니다.
-- 그러나 다음 규정이 관련 가능성이 있는 것으로 보입니다.
-- (요약 기반 관련 내용 정리)
-- [관련링크 : 규정명](링크URL)
-
-③ 검색 결과가 질문과 명확히 무관한 경우:
-- 관련 사규를 찾지 못했습니다.
-
-추가 제약:
-출력은 반드시 JSON object 한 개:
+[출력 스키마]
 {
   "standalone_query": "다음 턴 검색에 사용할 독립 질의",
-  "answer": "사용자에게 보여줄 답변"
+  "no_match": false,
+  "brief": "질문에서 추출한 의도(예: 출산, 지원, 대상)와 관련된 규정을 안내드립니다.",
+  "selected_ids": ["doc_1", "doc_3"],
+  "selection_reasons": {
+    "doc_1": "짧은 근거",
+    "doc_3": "짧은 근거"
+  }
 }
 """.strip()
 
@@ -91,8 +78,18 @@ KEYWORD_EXTRACT_SYSTEM_PROMPT = """
 1) 질문의 주변 맥락어(예: 우리, 회사, 나는, 이거, 좀)는 제외합니다.
 2) 규정 탐색에 직접 쓰일 실질 키워드만 2~5개 반환합니다.
 3) 한 단어 위주로 간결하게 반환합니다. (필요시 2어절까지 허용)
-4) 애매하면 복리후생/휴가/경비/지급/대상/조건/절차 관련 핵심어를 우선합니다.
-5) 출력은 JSON object 한 개만 반환합니다.
+4) 가족/친족 표현은 아래 기준으로 표준화 키워드를 우선 포함합니다.
+   - 외삼촌/이모/고모/고모부/외숙모/외숙부 -> 인척, 경조, 사망, 경조휴가, 경조금
+   - 조부모/외조부모 -> 조부모, 경조, 사망
+   - 배우자 부모/장인/장모/시부/시모 -> 배우자 가족, 인척, 경조
+   - 형제자매 배우자 -> 인척, 경조
+5) 이벤트 표현은 아래 기준으로 정규화합니다.
+   - 돌아가셨다/상/장례 -> 사망, 경조휴가, 경조금, 신청기한, 증빙
+   - 출산/애기 낳다 -> 출산, 복리후생, 지원금, 휴가, 신청기한
+   - 결혼/혼인 -> 결혼, 경조, 휴가, 지원금
+6) 애매하면 복리후생/휴가/경비/지급/대상/조건/절차 관련 핵심어를 우선합니다.
+7) 정책 해석/결론은 하지 말고 키워드 추출만 수행합니다.
+8) 출력은 JSON object 한 개만 반환합니다.
 
 출력 스키마:
 {
@@ -128,7 +125,7 @@ LATEST_REWRITE_SYSTEM_PROMPT = """
    - [관련링크 : 규정명](링크URL)
 7. 출력은 반드시 JSON object 한 개:
 {
-  "answer": "사용자에게 보여줄 최종 답변"
+  "answer": [사용자에게 보여줄 최종 답변]
 }
 """.strip()
 
@@ -147,6 +144,7 @@ class QueryDecision:
     keyword_source: str
     keyword_reason: str
     rerank_query: str
+    debug: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -304,6 +302,11 @@ def _is_meta_task_prompt(question: str) -> bool:
         "based on the chat history",
     )
     return any(marker in q for marker in markers)
+
+
+def is_meta_task_prompt(question: str) -> bool:
+    """서버 라우팅에서 사용할 공개 헬퍼."""
+    return _is_meta_task_prompt(question)
 
 
 def _sanitize_keywords(values: list[str], *, max_keywords: int = 5) -> list[str]:
@@ -586,6 +589,184 @@ def _build_context(result: SearchResult) -> str:
     return "\n\n".join(rows)
 
 
+def _build_candidate_docs_for_llm(hits: list[SearchHit], *, limit: int = 10) -> list[dict]:
+    candidates: list[dict] = []
+    for idx, hit in enumerate(hits[: max(1, limit)], 1):
+        candidates.append(
+            {
+                "id": f"doc_{idx}",
+                "title": hit.title,
+                "reg_date": hit.reg_date,
+                "summary": hit.summary_text,
+                "keywords": hit.summary_keywords,
+                "url": hit.source_url,
+            }
+        )
+    return candidates
+
+
+def _build_candidate_map(candidates: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for item in candidates:
+        key = str(item.get("id", "")).strip()
+        if not key:
+            continue
+        out[key] = item
+    return out
+
+
+def _candidate_rule_names(doc: dict) -> set[str]:
+    title = str(doc.get("title", "")).strip()
+    return _extract_rule_names(title)
+
+
+def _promote_selected_ids_to_latest(
+    selected_ids: list[str],
+    candidates: list[dict],
+    candidate_map: dict[str, dict],
+) -> list[str]:
+    """선택된 링크를 동일 규정군 최신본으로 승격한다."""
+    if not selected_ids or not candidates:
+        return selected_ids
+
+    latest_by_rule: dict[str, tuple[str, datetime]] = {}
+    for doc in candidates:
+        doc_id = str(doc.get("id", "")).strip()
+        if not doc_id:
+            continue
+        dt = _parse_reg_date(str(doc.get("reg_date", ""))) or datetime.min
+        for rule_name in _candidate_rule_names(doc):
+            prev = latest_by_rule.get(rule_name)
+            if prev is None or dt > prev[1]:
+                latest_by_rule[rule_name] = (doc_id, dt)
+
+    promoted: list[str] = []
+    seen: set[str] = set()
+    for sid in selected_ids:
+        current_id = str(sid or "").strip()
+        if not current_id or current_id not in candidate_map:
+            continue
+        current_doc = candidate_map[current_id]
+        current_dt = _parse_reg_date(str(current_doc.get("reg_date", ""))) or datetime.min
+        best_id = current_id
+        best_dt = current_dt
+        for rule_name in _candidate_rule_names(current_doc):
+            latest = latest_by_rule.get(rule_name)
+            if latest is None:
+                continue
+            latest_id, latest_dt = latest
+            if latest_dt > best_dt:
+                best_id = latest_id
+                best_dt = latest_dt
+        if best_id in seen:
+            continue
+        seen.add(best_id)
+        promoted.append(best_id)
+    return promoted
+
+
+def _pick_fallback_candidate_ids(candidates: list[dict], *, limit: int = 2) -> list[str]:
+    if not candidates:
+        return []
+    seen_titles: set[str] = set()
+    picked: list[str] = []
+    # fallback은 최신일자 우선이 아니라 "이미 랭크된 후보 순서"를 존중한다.
+    for doc in candidates:
+        title_key = _title_group_key(str(doc.get("title", "")))
+        if title_key and title_key in seen_titles:
+            continue
+        doc_id = str(doc.get("id", "")).strip()
+        if not doc_id:
+            continue
+        if title_key:
+            seen_titles.add(title_key)
+        picked.append(doc_id)
+        if len(picked) >= max(1, limit):
+            break
+    return picked
+
+
+def _build_intent_notice(
+    *,
+    current_question: str,
+    intent_terms: list[str],
+    no_match: bool,
+    link_count: int,
+    llm_brief: str,
+) -> str:
+    def _is_placeholder_brief(text: str) -> bool:
+        s = (text or "").strip()
+        if not s:
+            return True
+        blocked_phrases = (
+            "사용자에게 보일",
+            "1~2문장 요약",
+            "예시",
+            "placeholder",
+            "selected_ids",
+            "no_match",
+        )
+        return any(p in s.lower() for p in blocked_phrases)
+
+    terms = [str(t or "").strip() for t in intent_terms if str(t or "").strip()]
+    if not terms:
+        terms = _sanitize_keywords(
+            re.findall(r"[0-9A-Za-z가-힣]{2,}", current_question or ""),
+            max_keywords=3,
+        )
+    terms_text = ", ".join(terms[:3]) if terms else "질문 핵심 주제"
+    brief = (llm_brief or "").strip()
+    if brief and not _is_placeholder_brief(brief):
+        return brief
+    if no_match and link_count == 0:
+        return f"질문에서 추출한 의도({terms_text})와 직접 일치하는 규정을 찾지 못했습니다."
+    return f"질문에서 추출한 의도({terms_text})와 관련된 규정을 안내드립니다."
+
+
+def _render_link_focused_answer(
+    *,
+    current_question: str,
+    intent_terms: list[str],
+    brief: str,
+    selected_ids: list[str],
+    no_match: bool,
+    candidate_map: dict[str, dict],
+) -> str:
+    valid_ids: list[str] = []
+    seen: set[str] = set()
+    for sid in selected_ids:
+        key = str(sid or "").strip()
+        if not key or key in seen:
+            continue
+        if key not in candidate_map:
+            continue
+        seen.add(key)
+        valid_ids.append(key)
+
+    lines: list[str] = [
+        _build_intent_notice(
+            current_question=current_question,
+            intent_terms=intent_terms,
+            no_match=no_match,
+            link_count=len(valid_ids),
+            llm_brief=brief,
+        )
+    ]
+    if valid_ids:
+        lines.append("")
+        for sid in valid_ids:
+            doc = candidate_map[sid]
+            title = str(doc.get("title", "")).strip() or sid
+            url = str(doc.get("url", "")).strip()
+            if not url:
+                continue
+            lines.append(f"- [관련링크 : {title}]({url})")
+
+    if not lines:
+        return "질문에서 추출한 의도와 직접 일치하는 사규 링크를 찾지 못했습니다."
+    return "\n".join(lines).strip()
+
+
 def _build_expanded_query_by_intent(query: str) -> str:
     q = (query or "").strip()
     if not q:
@@ -664,14 +845,148 @@ def _search_with_low_score_fallback(query: str) -> SearchResult:
     return result
 
 
+def _recent_user_questions(messages: list[dict], *, limit: int = TOPIC_LOCK_MAX_USER_TURNS, exclude_question: str = "") -> list[str]:
+    out: list[str] = []
+    ex = (exclude_question or "").strip()
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        q = _strip_embedded_chat_history(_content_to_text(m.get("content", "")))
+        if not q:
+            continue
+        if ex and q == ex:
+            continue
+        out.append(q)
+        if len(out) >= max(1, limit):
+            break
+    out.reverse()
+    return out
+
+
+def _has_regulation_hints(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    hint_terms = (
+        "사규",
+        "규정",
+        "규칙",
+        "복리",
+        "복리후생",
+        "경조",
+        "경조금",
+        "결혼",
+        "사내부부",
+        "출산",
+        "육아",
+        "휴가",
+        "지원",
+        "수당",
+        "지급",
+        "대상",
+        "조건",
+        "절차",
+        "퇴사",
+        "입사",
+    )
+    return any(term in t for term in hint_terms)
+
+
+def has_regulation_hints(text: str) -> bool:
+    """서버 라우팅에서 사용할 공개 헬퍼."""
+    return _has_regulation_hints(text)
+
+
+def _is_ambiguous_followup(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    followup_markers = (
+        "아니지",
+        "그거",
+        "이거",
+        "그럼",
+        "맞아",
+        "맞지",
+        "그건",
+        "이건",
+        "받을 수",
+        "받을수",
+        "될까",
+        "되나",
+        "가능",
+    )
+    if any(marker in t for marker in followup_markers):
+        return True
+    return len(t) <= 18
+
+
+def should_topic_lock(messages: list[dict], current_question: str, *, max_user_turns: int = TOPIC_LOCK_MAX_USER_TURNS) -> bool:
+    current = _strip_embedded_chat_history(current_question)
+    if not current or _is_meta_task_prompt(current):
+        return False
+    recent = _recent_user_questions(messages, limit=max_user_turns, exclude_question=current)
+    if not recent:
+        return False
+    regulation_hits = sum(1 for q in recent if _has_regulation_hints(q))
+    if regulation_hits <= 0:
+        return False
+    # 직전 대화가 규정 주제면, 애매 후속질문뿐 아니라 규정 힌트 재지정 문장도 lock 유지
+    return _is_ambiguous_followup(current) or _has_regulation_hints(current)
+
+
+def _build_context_terms_from_recent_questions(
+    messages: list[dict],
+    current_question: str,
+    *,
+    max_user_turns: int = TOPIC_LOCK_MAX_USER_TURNS,
+) -> list[str]:
+    recent = _recent_user_questions(messages, limit=max_user_turns, exclude_question=current_question)
+    merged = " ".join(recent)
+    if not merged.strip():
+        return []
+    # 문맥 키워드는 heuristic으로 추출해 API 호출 추가를 막는다.
+    return _heuristic_regulation_keywords(merged, max_keywords=3)
+
+
+def _all_generic_keywords(keywords: list[str]) -> bool:
+    if not keywords:
+        return False
+    generic_set = {"대상", "조건", "지원", "절차", "가능", "여부", "기준", "내용", "규정"}
+    normalized = [k.strip().lower() for k in keywords if k.strip()]
+    return bool(normalized) and all(k in generic_set for k in normalized)
+
+
 def choose_search_query(messages: list[dict], current_question: str) -> QueryDecision:
     normalized_question = _strip_embedded_chat_history(current_question)
-    # regulation 라우트에서는 "원문 + 핵심 키워드" 멀티 검색을 수행한다.
     keyword_decision = extract_regulation_keywords(normalized_question, max_keywords=5)
     extracted_keywords = keyword_decision.cleaned_keywords
-    search_queries = _build_search_queries(normalized_question, extracted_keywords)
-    raw_results = [_search_with_low_score_fallback(q) for q in search_queries] if search_queries else []
-    merged_result = _merge_multi_query_results(raw_results)
+
+    # 단일 질의 정책:
+    # - 원문 질문 + LLM 추출 핵심키워드를 하나의 검색 질의로 결합
+    context_terms = _build_context_terms_from_recent_questions(
+        messages,
+        normalized_question,
+        max_user_turns=TOPIC_LOCK_MAX_USER_TURNS,
+    )
+    context_terms = _sanitize_keywords(context_terms, max_keywords=3)
+    use_context_terms = bool(context_terms and _all_generic_keywords(extracted_keywords))
+
+    keyword_parts = list(extracted_keywords)
+    if use_context_terms:
+        for kw in context_terms:
+            if kw not in keyword_parts:
+                keyword_parts.append(kw)
+    keyword_query = " ".join(keyword_parts).strip()
+    single_query = normalized_question
+    if keyword_query and keyword_query.lower() not in normalized_question.lower():
+        single_query = f"{normalized_question} {keyword_query}".strip()
+    search_queries = [single_query] if single_query else [normalized_question]
+    raw_results = [_search_with_low_score_fallback(search_queries[0])] if search_queries[0] else []
+    merged_result = raw_results[0] if raw_results else SearchResult(query=normalized_question, hits=[], mode="hybrid_single")
+    tie_reason = "single_query_keyword_rerank_score_first"
+    query_mode = "single_query"
+
     rerank_query = " ".join(extracted_keywords) if extracted_keywords else normalized_question
     reranked_result = _rerank_hits_by_last_query(merged_result, rerank_query)
     # 최종 rank는 리랭킹 score 기준을 우선한다.
@@ -685,7 +1000,7 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
         normalized_query=normalized_question,
         score_a=final_result.top_score,
         score_b=0.0,
-        tie_break_reason="multi_query_keyword_rerank_score_first",
+        tie_break_reason=tie_reason,
         result=final_result,
         extracted_keywords=extracted_keywords,
         search_queries=search_queries or [normalized_question],
@@ -693,6 +1008,22 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
         keyword_source=keyword_decision.source,
         keyword_reason=keyword_decision.reason,
         rerank_query=rerank_query,
+        debug={
+            "query_mode": query_mode,
+            "context_terms": context_terms,
+            "use_context_terms": use_context_terms,
+            "raw_result_count": len(raw_results),
+            "raw_query_scores": [
+                {
+                    "query": r.query,
+                    "mode": r.mode,
+                    "top_score": r.top_score,
+                    "hit_count": len(r.hits),
+                    "top_title": (r.hits[0].title if r.hits else ""),
+                }
+                for r in raw_results
+            ],
+        },
     )
 
 
@@ -707,7 +1038,13 @@ def _messages_to_history(messages: list[dict], *, max_user_turns: int = 4) -> st
     return "\n".join(out)
 
 
-def generate_answer_json(*, messages: list[dict], current_question: str, decision: QueryDecision) -> dict:
+def generate_answer_json(
+    *,
+    messages: list[dict],
+    current_question: str,
+    decision: QueryDecision,
+    use_llm_selector: bool = True,
+) -> dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
     client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
@@ -725,6 +1062,8 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
     )
     context_text = _build_context(answer_context_result)
     history_text = _messages_to_history(messages)
+    candidate_docs = _build_candidate_docs_for_llm(answer_context_hits, limit=ANSWER_CONTEXT_LIMIT)
+    candidate_map = _build_candidate_map(candidate_docs)
     user_prompt = (
         f"[검색에 사용된 질의]\n{decision.chosen_query}\n\n"
         f"[추출 키워드]\n{', '.join(decision.extracted_keywords) if decision.extracted_keywords else '없음'}\n\n"
@@ -732,37 +1071,72 @@ def generate_answer_json(*, messages: list[dict], current_question: str, decisio
         f"[검색 점수]\nscore_A={decision.score_a:.4f}, score_B={decision.score_b:.4f}\n"
         f"decision={decision.tie_break_reason}\n\n"
         f"[검색 컨텍스트]\n{context_text}\n\n"
+        f"[candidate_docs]\n{json.dumps(candidate_docs, ensure_ascii=False, indent=2)}\n\n"
         f"[최근 대화(최대 4턴)]\n{history_text}\n\n"
         f"[현재 사용자 질문]\n{current_question}"
     )
-    resp = client.chat.completions.create(
-        model=ANSWER_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        # temperature=0.1,
-        response_format={"type": "json_object"},
-    )
-    raw = (resp.choices[0].message.content or "").strip()
-    parsed = _safe_json_loads(raw)
+    parsed: dict = {}
+    raw = ""
+    if use_llm_selector:
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            # temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _safe_json_loads(raw)
+
     standalone_query = str(parsed.get("standalone_query", decision.chosen_query))
-    base_answer = str(parsed.get("answer", "")).strip() or raw
-    latest_aligned_answer = _rewrite_answer_with_latest_sources_if_needed(
-        client=client,
-        answer=base_answer,
+    brief = str(parsed.get("brief", "")).strip()
+    no_match = bool(parsed.get("no_match", False))
+    raw_selected = parsed.get("selected_ids", [])
+    selected_ids = [str(x).strip() for x in raw_selected] if isinstance(raw_selected, list) else []
+    selected_ids = [sid for sid in selected_ids if sid in candidate_map]
+    if not use_llm_selector:
+        selected_ids = _pick_fallback_candidate_ids(candidate_docs, limit=2)
+        no_match = len(selected_ids) == 0
+    elif not selected_ids:
+        # selector가 no_match로 닫았더라도 검색 점수가 충분히 높으면 링크 1~2개는 보수적으로 제공한다.
+        if no_match and decision.score_a >= 1.0:
+            selected_ids = _pick_fallback_candidate_ids(candidate_docs, limit=2)
+            no_match = len(selected_ids) == 0
+        elif not no_match:
+            selected_ids = _pick_fallback_candidate_ids(candidate_docs, limit=2)
+    selected_ids = _promote_selected_ids_to_latest(selected_ids, candidate_docs, candidate_map)
+
+    answer = _render_link_focused_answer(
         current_question=current_question,
-        decision=decision,
+        intent_terms=decision.extracted_keywords,
+        brief=brief,
+        selected_ids=selected_ids,
+        no_match=no_match,
+        candidate_map=candidate_map,
     )
-    answer = _dedupe_markdown_links(latest_aligned_answer.strip())
-    answer = _append_related_links_if_needed(
-        answer,
-        decision=decision,
-        current_question=current_question,
-    )
+    selected_links = [
+        {
+            "id": sid,
+            "title": str(candidate_map.get(sid, {}).get("title", "")),
+            "url": str(candidate_map.get(sid, {}).get("url", "")),
+        }
+        for sid in selected_ids
+        if sid in candidate_map
+    ]
     return {
         "standalone_query": standalone_query,
         "answer": answer,
+        "debug": {
+            "selector_mode": "llm_selector" if use_llm_selector else "rank_fallback_selector",
+            "llm_selector_raw": raw[:3000],
+            "llm_selector_parsed": parsed,
+            "candidate_count": len(candidate_docs),
+            "selected_ids": selected_ids,
+            "selected_links": selected_links,
+            "no_match": no_match,
+        },
     }
 
 
@@ -811,8 +1185,8 @@ def _extract_existing_links(answer: str) -> list[tuple[str, str]]:
 
 
 def _extract_rule_names(text: str) -> set[str]:
-    # 예: "경비지급규정", "복리후생규정", "위임전결규정", "취업규칙" 등
-    raw = re.findall(r"[0-9A-Za-z가-힣]+(?:규정|규칙|기준|준칙)", text or "")
+    # 예: "경비지급규정", "취업규칙", "운영방침", "시행지침", "관리부칙" 등
+    raw = re.findall(r"[0-9A-Za-z가-힣]+(?:규정|규칙|부칙|기준|방침|준칙|정책|지침|제정)", text or "")
     return {r.lower() for r in raw if r}
 
 

@@ -87,8 +87,21 @@ class FilterResult:
     keep_items: list[dict]
 
 
+def _extract_rule_names(title: str) -> list[str]:
+    raw = re.findall(r"[0-9A-Za-z가-힣]+(?:규정|규칙|부칙|기준|방침|준칙|정책|지침|제정)", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in raw:
+        key = r.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def normalize_title_to_key(title: str) -> str:
-    """제목에서 날짜/개정 표기를 제거해 regulation_key 생성."""
+    """제목에서 날짜/개정 표기를 제거해 regulation_key 생성(단일 fallback)."""
     v = (title or "").strip()
     for p in NOISE_PATTERNS:
         v = re.sub(p, " ", v)
@@ -96,7 +109,15 @@ def normalize_title_to_key(title: str) -> str:
         v = re.sub(p, " ", v)
     v = re.sub(r"\(\s*[^)]*\s*\)", " ", v)
     v = re.sub(r"\s+", " ", v).strip(" -_")
-    return v or title.strip()
+    return (v or title.strip()).lower()
+
+
+def normalize_title_to_keys(title: str) -> list[str]:
+    """번들 제목이면 규정명별 N개 key를 반환한다."""
+    rule_names = _extract_rule_names(title or "")
+    if rule_names:
+        return rule_names
+    return [normalize_title_to_key(title)]
 
 
 def _parse_date_safe(v: str) -> datetime:
@@ -128,15 +149,20 @@ def _to_keep_item(item: dict) -> dict:
 
 
 def rule_based_filter(board_list: list[dict]) -> FilterResult:
-    """규칙 기반 1차 최신본 선별."""
+    """규칙 기반 1차 최신본 선별.
+
+    번들 문서는 규정명별 N개 그룹에 동시에 매핑한다.
+    """
     groups: dict[str, list[dict]] = {}
     for item in board_list:
-        key = normalize_title_to_key(item.get("title", ""))
-        groups.setdefault(key, []).append(item)
+        keys = normalize_title_to_keys(item.get("title", ""))
+        for key in keys:
+            groups.setdefault(key, []).append(item)
 
     regulation_list: list[dict] = []
     keep_urls: list[str] = []
     keep_items: list[dict] = []
+    seen_keep_urls: set[str] = set()
     for key, items in groups.items():
         if len(items) == 1:
             keep = items[0]
@@ -153,8 +179,11 @@ def rule_based_filter(board_list: list[dict]) -> FilterResult:
                 },
             }
         )
-        keep_urls.append(keep.get("source_url", ""))
-        keep_items.append(_to_keep_item(keep))
+        keep_url = keep.get("source_url", "")
+        if keep_url and keep_url not in seen_keep_urls:
+            seen_keep_urls.add(keep_url)
+            keep_urls.append(keep_url)
+            keep_items.append(_to_keep_item(keep))
 
     return FilterResult(
         input_count=len(board_list),

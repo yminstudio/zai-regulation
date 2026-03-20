@@ -17,6 +17,7 @@ class SearchHit:
     source_url: str
     summary_text: str
     summary_keywords: list[str]
+    rule_names: list[str]
     reg_date: str
     reg_user: str
     score: float
@@ -47,7 +48,7 @@ def _build_graphql(class_name: str, vector: list[float], limit: int) -> str:
     return (
         "{ Get { "
         f"{class_name}(nearVector: {{vector: {vec}}}, limit: {limit}) "
-        "{ original_id title source_url summary_text summary_keywords reg_date reg_user "
+        "{ original_id title source_url summary_text summary_keywords rule_names reg_date reg_user "
         "_additional { distance } } } }"
     )
 
@@ -67,7 +68,7 @@ def _build_hybrid_graphql(
     return (
         "{ Get { "
         f"{class_name}(hybrid: {{query: {q}, alpha: {alpha}, vector: {vec}, fusionType: relativeScoreFusion}}{autocut_part}, limit: {limit}) "
-        "{ original_id title source_url summary_text summary_keywords reg_date reg_user "
+        "{ original_id title source_url summary_text summary_keywords rule_names reg_date reg_user "
         "_additional { distance score } } } }"
     )
 
@@ -101,6 +102,7 @@ def _parse_hits(items: list[dict]) -> list[SearchHit]:
                 source_url=item.get("source_url", ""),
                 summary_text=item.get("summary_text", ""),
                 summary_keywords=item.get("summary_keywords", []) or [],
+                rule_names=item.get("rule_names", []) or [],
                 reg_date=item.get("reg_date", ""),
                 reg_user=item.get("reg_user", ""),
                 score=score,

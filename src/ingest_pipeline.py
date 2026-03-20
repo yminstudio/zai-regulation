@@ -16,7 +16,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from openai import OpenAI
 
-from src.config import DATA_DIR, OPENAI_API_KEY, PROJECT_WEAVIATE_CLASS
+from src.config import (
+    DATA_DIR,
+    OPENAI_API_KEY,
+    PROJECT_WEAVIATE_CLASS,
+    PROJECT_WEAVIATE_TEST_CLASS,
+)
 from src.extractors import extract_text
 from src.filter_latest import llm_refine_filter, rule_based_filter
 from src.gw_downloader import GWDownloader
@@ -399,7 +404,7 @@ def run_pipeline(options: PipelineOptions) -> dict:
             ensure_collection(
                 options.weaviate_class,
                 replace_own_collection=bool(options.replace_own_collection),
-                allowed_replace_classes=[PROJECT_WEAVIATE_CLASS],
+                allowed_replace_classes=[PROJECT_WEAVIATE_CLASS, PROJECT_WEAVIATE_TEST_CLASS],
             )
             ingest_report = upsert_documents(
                 class_name=options.weaviate_class,
