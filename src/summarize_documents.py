@@ -137,7 +137,7 @@ def _chat(client: OpenAI, system: str, user: str) -> str:
     if not user.strip():
         return ""
     resp = client.chat.completions.create(
-        model="gpt-4.1-nano",
+        model="gpt-5.4",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},

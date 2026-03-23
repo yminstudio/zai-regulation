@@ -98,6 +98,30 @@ KEYWORD_EXTRACT_SYSTEM_PROMPT = """
 }
 """.strip()
 
+FINAL_ANSWER_WRITER_SYSTEM_PROMPT = """
+당신은 KG제로인 사규 안내 챗봇입니다.
+역할은 "선택된 문서 링크를 바탕으로, 사용자 질문에 맞는 자연스러운 안내문"을 작성하는 것입니다.
+
+중요:
+1) 정책 해석을 단정하지 말고, 문서에 무엇이 담겨 있는지 안내 중심으로 작성하세요.
+2) 어조는 부드럽고 자연스럽게 작성하세요. (기계적/딱딱한 문구 금지)
+3) "질문에서 추출한 의도", "관련 가능성" 같은 메타 문구는 사용하지 마세요.
+4) 각 문서 설명은 1~2문장으로, 해당 문서에 포함된 기준/절차/대상/조건을 짧게 요약하세요.
+5) URL, 문서 id는 절대 생성하거나 수정하지 마세요. 설명문 텍스트만 작성하세요.
+6) "doc_1", "doc_2" 같은 내부 id를 사용자 노출 문장에 절대 쓰지 마세요.
+6) 출력은 반드시 JSON object 한 개만 반환하세요.
+
+출력 스키마:
+{
+  "intro": "전체 안내 1~2문장",
+  "item_descriptions": {
+    "doc_1": "문서 설명",
+    "doc_2": "문서 설명"
+  },
+  "closing": "마무리 1문장"
+}
+""".strip()
+
 NON_REGULATION_SYSTEM_PROMPT = f"""
 당신은 KG제로인 사규 챗봇입니다.
 사규와 무관한 질문에도 친절하게 답하되, 챗봇의 역할 경계를 유지하세요.
@@ -714,13 +738,114 @@ def _build_intent_notice(
             re.findall(r"[0-9A-Za-z가-힣]{2,}", current_question or ""),
             max_keywords=3,
         )
-    terms_text = ", ".join(terms[:3]) if terms else "질문 핵심 주제"
+    # 톤 일관성을 위해 서버에서 자연스러운 안내문을 고정해 사용한다.
     brief = (llm_brief or "").strip()
-    if brief and not _is_placeholder_brief(brief):
-        return brief
+    if brief and _is_placeholder_brief(brief):
+        brief = ""
     if no_match and link_count == 0:
-        return f"질문에서 추출한 의도({terms_text})와 직접 일치하는 규정을 찾지 못했습니다."
-    return f"질문에서 추출한 의도({terms_text})와 관련된 규정을 안내드립니다."
+        return "딱 맞는 문서를 고르기는 어려웠지만, 먼저 확인해보시면 도움이 될 만한 규정을 정리해봤어요."
+    return "확인해볼 만한 사규를 찾아봤어요. 아래 문서부터 보시면 가장 빠르게 판단하실 수 있어요."
+
+
+def _shorten_summary(text: str, *, max_len: int = 170) -> str:
+    # 문자열 길이를 강제로 자르지 않고, 첫 완결 문장만 사용한다.
+    # (max_len은 기존 호출부 호환을 위한 인자이며, 절단에는 사용하지 않는다.)
+    src = re.sub(r"\s+", " ", text or "")
+    if not src:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", src)
+    first_sentence = sentences[0] if sentences else src
+    return first_sentence.rstrip(" ,;:/-")
+
+
+def _build_doc_brief_description(doc: dict, intent_terms: list[str]) -> str:
+    points = _pick_link_points(doc.get("keywords", []) or [], intent_terms, max_points=3)
+    if points:
+        return f"이 문서에는 {', '.join(points)} 관련 기준과 절차가 정리돼 있어요."
+
+    summary_first_sentence = _shorten_summary(str(doc.get("summary", "")))
+    if summary_first_sentence:
+        return summary_first_sentence
+
+    return "이 문서에는 적용 대상, 기준, 절차 같은 핵심 내용이 정리돼 있어요."
+
+
+def _build_llm_writer_output(
+    *,
+    client: OpenAI,
+    current_question: str,
+    intent_terms: list[str],
+    selected_docs: list[dict],
+) -> tuple[str, dict[str, str], str]:
+    if not selected_docs:
+        return "", {}, ""
+
+    writer_payload = {
+        "question": current_question,
+        "intent_terms": intent_terms,
+        "selected_docs": [
+            {
+                "id": str(d.get("id", "")),
+                "title": str(d.get("title", "")),
+                "summary": str(d.get("summary", "")),
+                "keywords": d.get("keywords", []) or [],
+            }
+            for d in selected_docs
+        ],
+    }
+    try:
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[
+                {"role": "system", "content": FINAL_ANSWER_WRITER_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(writer_payload, ensure_ascii=False)},
+            ],
+            response_format={"type": "json_object"},
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _safe_json_loads(raw)
+    except Exception:
+        return "", {}, ""
+
+    intro = str(parsed.get("intro", "")).strip()
+    closing = str(parsed.get("closing", "")).strip()
+    raw_items = parsed.get("item_descriptions", {})
+    item_descriptions: dict[str, str] = {}
+    if isinstance(raw_items, dict):
+        for key, value in raw_items.items():
+            sid = str(key or "").strip()
+            desc = str(value or "").strip()
+            if sid and desc:
+                item_descriptions[sid] = desc
+    return intro, item_descriptions, closing
+
+
+def _replace_doc_id_mentions(text: str, selected_docs: list[dict]) -> str:
+    src = str(text or "")
+    if not src.strip():
+        return ""
+    out = src
+    for doc in selected_docs:
+        sid = str(doc.get("id", "")).strip()
+        title = str(doc.get("title", "")).strip()
+        if not sid:
+            continue
+        replacement = title or "해당 문서"
+        out = re.sub(rf"\b{re.escape(sid)}\b", replacement, out, flags=re.IGNORECASE)
+    return out.strip()
+
+
+def _pick_link_points(doc_keywords: list[str], intent_terms: list[str], *, max_points: int = 3) -> list[str]:
+    kws = [str(k).strip() for k in (doc_keywords or []) if str(k).strip()]
+    if not kws:
+        return []
+    terms = [str(t).strip().lower() for t in (intent_terms or []) if str(t).strip()]
+    if not terms:
+        return kws[: max(1, max_points)]
+    overlap = [kw for kw in kws if any(t in kw.lower() for t in terms)]
+    if overlap:
+        return overlap[: max(1, max_points)]
+    return kws[: max(1, max_points)]
 
 
 def _render_link_focused_answer(
@@ -731,6 +856,9 @@ def _render_link_focused_answer(
     selected_ids: list[str],
     no_match: bool,
     candidate_map: dict[str, dict],
+    writer_intro: str = "",
+    writer_item_descriptions: dict[str, str] | None = None,
+    writer_closing: str = "",
 ) -> str:
     valid_ids: list[str] = []
     seen: set[str] = set()
@@ -743,24 +871,34 @@ def _render_link_focused_answer(
         seen.add(key)
         valid_ids.append(key)
 
-    lines: list[str] = [
-        _build_intent_notice(
-            current_question=current_question,
-            intent_terms=intent_terms,
-            no_match=no_match,
-            link_count=len(valid_ids),
-            llm_brief=brief,
-        )
-    ]
+    item_desc_map = writer_item_descriptions or {}
+    first_line = (writer_intro or "").strip() or _build_intent_notice(
+        current_question=current_question,
+        intent_terms=intent_terms,
+        no_match=no_match,
+        link_count=len(valid_ids),
+        llm_brief=brief,
+    )
+    lines: list[str] = [first_line]
     if valid_ids:
         lines.append("")
-        for sid in valid_ids:
+        for idx, sid in enumerate(valid_ids, 1):
             doc = candidate_map[sid]
             title = str(doc.get("title", "")).strip() or sid
             url = str(doc.get("url", "")).strip()
             if not url:
                 continue
-            lines.append(f"- [관련링크 : {title}]({url})")
+            brief_desc = (
+                item_desc_map.get(sid, "").strip()
+                or _build_doc_brief_description(doc, intent_terms)
+            )
+            lines.append(f"{idx}) [{title}]({url})")
+            lines.append(brief_desc)
+            lines.append("")
+        lines.append(
+            (writer_closing or "").strip()
+            or "필요하시면 질문하신 상황 기준으로 어떤 문서부터 읽으면 되는지 순서까지 짚어드릴게요."
+        )
 
     if not lines:
         return "질문에서 추출한 의도와 직접 일치하는 사규 링크를 찾지 못했습니다."
@@ -1044,6 +1182,7 @@ def generate_answer_json(
     current_question: str,
     decision: QueryDecision,
     use_llm_selector: bool = True,
+    use_llm_writer: bool = True,
 ) -> dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
@@ -1107,6 +1246,24 @@ def generate_answer_json(
         elif not no_match:
             selected_ids = _pick_fallback_candidate_ids(candidate_docs, limit=2)
     selected_ids = _promote_selected_ids_to_latest(selected_ids, candidate_docs, candidate_map)
+    selected_docs = [candidate_map[sid] for sid in selected_ids if sid in candidate_map]
+
+    writer_intro = ""
+    writer_item_descriptions: dict[str, str] = {}
+    writer_closing = ""
+    if use_llm_writer and selected_docs:
+        writer_intro, writer_item_descriptions, writer_closing = _build_llm_writer_output(
+            client=client,
+            current_question=current_question,
+            intent_terms=decision.extracted_keywords,
+            selected_docs=selected_docs,
+        )
+        writer_intro = _replace_doc_id_mentions(writer_intro, selected_docs)
+        writer_closing = _replace_doc_id_mentions(writer_closing, selected_docs)
+        writer_item_descriptions = {
+            sid: _replace_doc_id_mentions(desc, selected_docs)
+            for sid, desc in writer_item_descriptions.items()
+        }
 
     answer = _render_link_focused_answer(
         current_question=current_question,
@@ -1115,6 +1272,9 @@ def generate_answer_json(
         selected_ids=selected_ids,
         no_match=no_match,
         candidate_map=candidate_map,
+        writer_intro=writer_intro,
+        writer_item_descriptions=writer_item_descriptions,
+        writer_closing=writer_closing,
     )
     selected_links = [
         {
@@ -1130,8 +1290,11 @@ def generate_answer_json(
         "answer": answer,
         "debug": {
             "selector_mode": "llm_selector" if use_llm_selector else "rank_fallback_selector",
+            "writer_mode": "llm_writer" if use_llm_writer else "rule_writer",
             "llm_selector_raw": raw[:3000],
             "llm_selector_parsed": parsed,
+            "llm_writer_intro": writer_intro,
+            "llm_writer_item_count": len(writer_item_descriptions),
             "candidate_count": len(candidate_docs),
             "selected_ids": selected_ids,
             "selected_links": selected_links,

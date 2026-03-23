@@ -49,10 +49,11 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = "gpt-4.1-nano"
+    model: str = "gpt-5.4"
     messages: list[ChatMessage]
     stream: bool = True
     use_llm_selector: bool = True
+    use_llm_writer: bool = True
     shadow_compare: bool = False
 
 
@@ -225,6 +226,7 @@ def regulation_chat(req: ChatRequest, request: Request):
             current_question=current_question,
             decision=decision,
             use_llm_selector=req.use_llm_selector,
+            use_llm_writer=req.use_llm_writer,
         )
         answer = out.get("answer", "").strip()
         standalone_query = out.get("standalone_query", "").strip()
@@ -249,6 +251,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                 "request_modes": {
                     "use_multi_query": False,
                     "use_llm_selector": req.use_llm_selector,
+                    "use_llm_writer": req.use_llm_writer,
                     "shadow_compare": req.shadow_compare,
                 },
                 "search_debug": decision.debug,
@@ -279,8 +282,8 @@ def regulation_chat(req: ChatRequest, request: Request):
 
         if req.shadow_compare:
             shadow_cases = [
-                {"name": "selector_on", "use_llm_selector": True},
-                {"name": "selector_off", "use_llm_selector": False},
+                {"name": "selector_on", "use_llm_selector": True, "use_llm_writer": req.use_llm_writer},
+                {"name": "selector_off", "use_llm_selector": False, "use_llm_writer": req.use_llm_writer},
             ]
             shadow_results: list[dict] = []
             for case in shadow_cases:
@@ -292,6 +295,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                     current_question=current_question,
                     decision=d,
                     use_llm_selector=case["use_llm_selector"],
+                    use_llm_writer=case["use_llm_writer"],
                 )
                 candidate_answer = str(o.get("answer", "")).strip()
                 candidate_links = _extract_link_urls(candidate_answer)
@@ -300,6 +304,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                         "name": case["name"],
                         "use_multi_query": False,
                         "use_llm_selector": case["use_llm_selector"],
+                        "use_llm_writer": case["use_llm_writer"],
                         "top_score": d.score_a,
                         "search_queries": d.search_queries,
                         "search_debug": d.debug,
@@ -316,6 +321,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                     "primary_modes": {
                         "use_multi_query": False,
                         "use_llm_selector": req.use_llm_selector,
+                        "use_llm_writer": req.use_llm_writer,
                     },
                     "primary_top_score": decision.score_a,
                     "primary_answer_link_count": len(answer_links),

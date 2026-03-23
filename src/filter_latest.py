@@ -210,7 +210,7 @@ def llm_refine_filter(board_list: list[dict], *, use_llm: bool = True) -> Filter
     )
     try:
         resp = client.chat.completions.create(
-            model="gpt-4.1-nano",
+            model="gpt-5.4",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
