@@ -13,7 +13,7 @@ import json
 
 from openai import OpenAI
 
-from src.config import DATA_DIR, OPENAI_API_KEY
+from src.config import DATA_DIR, OPENAI_API_KEY, SUMMARIZE_MODEL
 from src.extractors import extract_text
 
 INPUT_PATH = DATA_DIR / "regulation_schema_seed.json"
@@ -137,7 +137,7 @@ def _chat(client: OpenAI, system: str, user: str) -> str:
     if not user.strip():
         return ""
     resp = client.chat.completions.create(
-        model="gpt-5.4",
+        model=SUMMARIZE_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},

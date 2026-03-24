@@ -49,7 +49,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = "gpt-5.4"
+    model: str = "gpt-5.4-nano"
     messages: list[ChatMessage]
     stream: bool = True
     use_llm_selector: bool = True

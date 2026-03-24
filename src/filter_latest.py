@@ -8,7 +8,7 @@ from datetime import datetime
 
 from openai import OpenAI
 
-from src.config import OPENAI_API_KEY
+from src.config import OPENAI_API_KEY, SUMMARIZE_MODEL
 
 DATE_PATTERNS = [
     r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}",
@@ -210,7 +210,7 @@ def llm_refine_filter(board_list: list[dict], *, use_llm: bool = True) -> Filter
     )
     try:
         resp = client.chat.completions.create(
-            model="gpt-5.4",
+            model=SUMMARIZE_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},

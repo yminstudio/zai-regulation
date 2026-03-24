@@ -18,8 +18,8 @@ load_dotenv(VENV_ENV_PATH)
 # --- OpenAI ---
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-SUMMARIZE_MODEL: str = os.getenv("SUMMARIZE_MODEL", "gpt-5.4")
-ANSWER_MODEL: str = os.getenv("ANSWER_MODEL", "gpt-5.4")
+SUMMARIZE_MODEL: str = os.getenv("SUMMARIZE_MODEL", "gpt-5.4-nano")
+ANSWER_MODEL: str = os.getenv("ANSWER_MODEL", "gpt-5.4-nano")
 
 # --- Groupware ---
 GW_USER_ID: str = os.getenv("GW_USER_ID", "")
