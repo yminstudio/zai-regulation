@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 
 from src.config import DATA_DIR, SUMMARIZE_MODEL
 from src.extractors import extract_text
@@ -25,8 +26,8 @@ FIRST_STAGE_SYSTEM_PROMPT = """
 입력은 사내 게시글에 첨부된 파일 1개의 원문 텍스트입니다.
 이 파일은 규정 본문, 별표, 별첨, 결재선, 참고자료, 양식, 안내문 등 다양한 형태일 수 있습니다.
 
-당신의 목표는 이 첨부파일 1개만 독립적으로 읽고,
-이후 통합 요약과 검색에 활용할 수 있도록 핵심 내용을 충분히 보존한 한국어 요약문을 작성하는 것입니다.
+목표:
+- 이 파일만 읽고, 후속 검색/임베딩에 쓸 수 있는 요약을 만든다.
 
 중요 규칙:
 
@@ -35,11 +36,8 @@ FIRST_STAGE_SYSTEM_PROMPT = """
 3. 규정에서 등장하는 **숫자, 금액, 기간, 일자, 비율(%), 한도, 기한, 조건, 기준**은 가능한 한 그대로 유지하세요.
 4. 규정에서 정의된 **절차, 승인 단계, 제출 기한, 지급 기준**이 있다면 반드시 포함하세요.
 5. 별첨, 별표, 양식, 기준표가 포함된 경우 어떤 기준을 담고 있는지 설명하세요.
-6. OCR 오류나 문장 깨짐이 있더라도 과도하게 추측하지 마세요.
-7. 문장을 지나치게 축약하지 말고 **핵심 규정 내용이 충분히 남도록 요약**하세요.
-8. 불필요한 서론 없이 바로 규정 내용을 설명하세요.
-9. 문단 수는 제한하지 않지만 **핵심 규정 기준이 빠지지 않도록 작성**하세요.
-10. 첨부파일 원문에 없는 게시글 공지성 정보(예: 신청일/승인일, 완료 여부, 신고 진행상황)는 요약에 포함하지 마세요.
+6. 불필요한 서론 없이 바로 규정 내용을 설명하세요.
+7. 문단 수는 제한하지 않지만 **핵심 규정 기준이 빠지지 않도록 작성**하세요.
 
 목표:
 이 요약만 읽어도 해당 첨부파일이 어떤 규정이며
@@ -76,7 +74,7 @@ FIRST_STAGE_USER_TEMPLATE = """
 - 규정에서 정의된 주요 항목(예: 출장비, 식대, 교통비 등)은 구분하여 설명하세요.
 - 별첨이나 기준표가 있으면 어떤 기준을 담고 있는지 요약하세요.
 - 다른 첨부파일과의 관계를 단정하지 마세요.
-- 첨부파일 원문에 없는 신청/승인 날짜 사례를 임의로 추가하지 마세요.
+- 원문에 없는 사실은 추가하지 마세요.
 
 출력 형식(반드시 아래 형식으로만 출력하세요):
 SUMMARY:
@@ -86,25 +84,23 @@ KEYWORDS:
 """.strip()
 
 SECOND_STAGE_SYSTEM_PROMPT = """
-당신은 사내 게시글의 제목, 본문, 첨부파일별 요약 정보를 바탕으로 RAG 검색과 벡터 임베딩에 최적화된 최종 통합 요약을 작성하는 AI입니다.
+당신은 사내 규정 게시글 통합 요약기입니다.
+입력은 title, source_text, 첨부파일별 summary/keywords 입니다.
 
-입력은 하나의 게시글 정보이며, 게시글 제목, 본문, 첨부파일 이름, 첨부파일별 개별 요약이 제공됩니다.
-
-당신의 목표는 summary_text 필드에 들어갈 최종 통합 요약문을 작성하는 것입니다.
-
+목표:
+summary_text 필드에 들어갈 최종 통합 요약문을 작성한다.
 이 요약문은 단순 축약이 아니라, 사용자가 사내 규정을 검색할 때 잘 검색되도록 핵심 규정명과 구체 주제를 풍부하게 담은 설명문이어야 합니다.
 
 중요 규칙:
 1. 게시글에 여러 첨부파일이 있더라도, 같은 규정의 본문/별표/별첨/결재선/참고자료는 하나의 맥락으로 자연스럽게 묶어 설명하세요.
 2. 결재선, 참고자료, 부속 문서는 핵심 규정보다 덜 중요하므로 필요 범위에서만 짧게 반영하세요.
 3. 서로 다른 규정이나 서로 다른 핵심 주제가 함께 포함되어 있다면, 각각의 규정명과 핵심 내용을 빠뜨리지 말고 모두 반영하세요.
-4. 가능한 경우 일반어 대신 구체 표현을 사용하세요.
-5. 규정명, 적용 대상, 절차, 기준, 금액, 기간, 예외, 승인 조건 등 검색에 중요한 정보는 가능한 한 유지하세요.
-6. 게시글 제목과 본문에만 있고 첨부 요약에 없는 중요한 맥락도 반영하세요.
-7. 문서에 없는 내용을 추측하지 마세요.
-8. 출력은 plain text 하나의 완성된 설명문으로만 작성하세요.
-9. 사람이 읽어도 자연스럽고, 벡터 검색에도 잘 걸릴 수 있도록 정보량 있게 작성하세요.
-10. 게시글 본문의 공지성 진행정보(예: 신청/승인 일자, 완료 보고, 장소 안내, 서명 절차)는 규정 조항으로 단정하지 말고 핵심 규정 요약에서 우선 제외하세요.
+4. 규정명, 적용 대상, 절차, 기준, 금액, 기간, 예외, 승인 조건 등 검색에 중요한 정보는 가능한 한 유지하세요.
+5. 문서에 없는 내용을 추측하지 마세요.
+6. 출력은 plain text 하나의 완성된 설명문으로만 작성하세요.
+7. 사람이 읽어도 자연스럽고, 벡터 검색에도 잘 걸릴 수 있도록 정보량 있게 작성하세요.
+8. 공지성 진행정보(예: 특정 신청일/승인완료 보고)는 규정 조항처럼 쓰지 않는다.
+
 """.strip()
 
 SECOND_STAGE_USER_TEMPLATE = """
@@ -125,10 +121,7 @@ file_info:
 - 제목, 게시글 본문, 모든 첨부파일 요약을 함께 반영하세요.
 - 하나의 규정에 대한 여러 첨부파일이면 하나의 규정 맥락으로 자연스럽게 묶으세요.
 - 서로 다른 규정이 함께 있으면 각 규정명과 핵심 내용을 모두 드러내세요.
-- 결재선, 참고자료, 보조 첨부파일은 핵심 규정보다 덜 자세하게 반영하세요.
-- 사용자가 실제 검색할 만한 구체 주제 표현을 포함하세요.
-- 규정명, 대상, 절차, 기준, 금액, 기간, 조건, 예외가 있으면 가능한 범위에서 포함하세요.
-- 너무 짧지 않게, 검색에 도움이 되도록 충분한 정보량으로 작성하세요.
+- 검색에 걸릴 핵심 표현(규정명/대상/절차/기준/조건/예외/수치)을 유지하세요.
 - 결과는 summary_text에 넣을 텍스트만 출력하세요.
 """.strip()
 
@@ -136,15 +129,25 @@ file_info:
 def _chat(client: LLMClient, system: str, user: str) -> str:
     if not user.strip():
         return ""
-    resp = client.chat.completions.create(
-        model=SUMMARIZE_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        # temperature=0.1,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    last_error: Exception | None = None
+    # 대용량 첨부/혼잡 시간대에 Ollama 응답이 간헐적으로 timeout 나므로 재시도한다.
+    for attempt in range(1, 4):
+        try:
+            resp = client.chat.completions.create(
+                model=SUMMARIZE_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # temperature=0.1,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            last_error = e
+            if attempt >= 3:
+                break
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"summarize chat failed after retries: {last_error}") from last_error
 
 
 def _parse_file_summary_response(raw: str) -> tuple[str, list[str]]:

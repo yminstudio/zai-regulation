@@ -15,3 +15,4 @@ pypdfium2
 openpyxl
 xlrd
 PyYAML
+sentence-transformers

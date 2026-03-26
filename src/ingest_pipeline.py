@@ -16,6 +16,10 @@ from uuid import NAMESPACE_URL, uuid5
 
 from src.config import (
     DATA_DIR,
+    EMBEDDING_BACKEND,
+    LOCAL_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_MODEL,
+    PROJECT_WEAVIATE_DB_CLASS,
     PROJECT_WEAVIATE_CLASS,
     PROJECT_WEAVIATE_TEST_CLASS,
 )
@@ -51,6 +55,8 @@ class PipelineOptions:
     ingest_weaviate: bool = True
     weaviate_class: str = PROJECT_WEAVIATE_CLASS
     replace_own_collection: bool = True
+    embedding_backend: str = EMBEDDING_BACKEND
+    embedding_model: str = ""
 
 
 def _utc_now() -> str:
@@ -293,60 +299,102 @@ def collect_and_filter(
 
 
 def summarize_docs(*, paths: RunPaths, docs: list[dict]) -> list[dict]:
-    client = LLMClient(timeout=120.0)
+    client = LLMClient(timeout=300.0)
     out_docs: list[dict] = []
+    total_docs = len(docs)
 
-    for doc in docs:
-        source_text = doc.get("source_text", "") or ""
+    for idx, doc in enumerate(docs, 1):
+        title = doc.get("title", "") or ""
+        source_url = doc.get("source_url", "") or ""
         files = doc.get("file_info", []) or []
-        all_keywords: list[str] = []
-        file_rows: list[dict] = []
+        started_at = _utc_now()
+        write_log(
+            "summarize_doc_start",
+            {
+                "index": idx,
+                "total": total_docs,
+                "title": title,
+                "source_url": source_url,
+                "file_count": len(files),
+                "started_at": started_at,
+            },
+            log_path=paths.log_file,
+        )
+        try:
+            source_text = doc.get("source_text", "") or ""
+            all_keywords: list[str] = []
+            file_rows: list[dict] = []
 
-        for f in files:
-            name = f.get("name") or f.get("file_name") or ""
-            parsed_path = Path(f.get("parsed_path", "")) if f.get("parsed_path") else None
-            file_text = ""
-            if parsed_path and parsed_path.exists():
-                file_text = parsed_path.read_text(encoding="utf-8")
-            file_summary, file_keywords = _file_summary(
+            for f in files:
+                name = f.get("name") or f.get("file_name") or ""
+                parsed_path = Path(f.get("parsed_path", "")) if f.get("parsed_path") else None
+                file_text = ""
+                if parsed_path and parsed_path.exists():
+                    file_text = parsed_path.read_text(encoding="utf-8")
+                file_summary, file_keywords = _file_summary(
+                    client,
+                    title=title,
+                    file_name=name,
+                    file_text=file_text,
+                )
+                for kw in file_keywords:
+                    if kw and kw not in all_keywords:
+                        all_keywords.append(kw)
+                file_rows.append(
+                    {
+                        "name": name,
+                        "summary": file_summary,
+                        "keywords": file_keywords,
+                        "parsed_path": f.get("parsed_path", ""),
+                        "extract_method": f.get("extract_method", ""),
+                    }
+                )
+
+            doc_summary = _doc_summary(
                 client,
-                title=doc.get("title", "") or "",
-                file_name=name,
-                file_text=file_text,
+                title=title,
+                source_text=source_text,
+                file_info=file_rows,
             )
-            for kw in file_keywords:
-                if kw and kw not in all_keywords:
-                    all_keywords.append(kw)
-            file_rows.append(
+            out_docs.append(
                 {
-                    "name": name,
-                    "summary": file_summary,
-                    "keywords": file_keywords,
-                    "parsed_path": f.get("parsed_path", ""),
-                    "extract_method": f.get("extract_method", ""),
+                    "original_id": doc.get("original_id"),
+                    "title": title,
+                    "reg_num": doc.get("reg_num"),
+                    "reg_user": doc.get("reg_user"),
+                    "reg_date": doc.get("reg_date"),
+                    "source_url": source_url,
+                    "source_text": source_text,
+                    "file_info": file_rows,
+                    "summary_text": doc_summary,
+                    "summary_keywords": all_keywords,
                 }
             )
-
-        doc_summary = _doc_summary(
-            client,
-            title=doc.get("title", "") or "",
-            source_text=source_text,
-            file_info=file_rows,
-        )
-        out_docs.append(
-            {
-                "original_id": doc.get("original_id"),
-                "title": doc.get("title"),
-                "reg_num": doc.get("reg_num"),
-                "reg_user": doc.get("reg_user"),
-                "reg_date": doc.get("reg_date"),
-                "source_url": doc.get("source_url"),
-                "source_text": source_text,
-                "file_info": file_rows,
-                "summary_text": doc_summary,
-                "summary_keywords": all_keywords,
-            }
-        )
+            write_log(
+                "summarize_doc_done",
+                {
+                    "index": idx,
+                    "total": total_docs,
+                    "title": title,
+                    "source_url": source_url,
+                    "keywords_count": len(all_keywords),
+                    "summary_length": len(doc_summary or ""),
+                },
+                log_path=paths.log_file,
+            )
+        except Exception as e:
+            write_log(
+                "summarize_doc_failed",
+                {
+                    "index": idx,
+                    "total": total_docs,
+                    "title": title,
+                    "source_url": source_url,
+                    "error": str(e),
+                },
+                log_path=paths.log_file,
+            )
+            raise
 
     _write_json(paths.interim / "06_summaries_interim.json", out_docs)
     _write_json(paths.result / "07_final_for_ingest.json", out_docs)
@@ -380,6 +428,8 @@ def run_pipeline(options: PipelineOptions) -> dict:
         "weaviate_ingest_enabled": bool(options.ingest_weaviate),
         "weaviate_class": options.weaviate_class,
         "replace_own_collection": bool(options.replace_own_collection),
+        "embedding_backend": options.embedding_backend,
+        "embedding_model": options.embedding_model,
     }
     _write_manifest(paths, status="running", started_at=started_at, options=option_payload)
     write_log(
@@ -401,12 +451,19 @@ def run_pipeline(options: PipelineOptions) -> dict:
             ensure_collection(
                 options.weaviate_class,
                 replace_own_collection=bool(options.replace_own_collection),
-                allowed_replace_classes=[PROJECT_WEAVIATE_CLASS, PROJECT_WEAVIATE_TEST_CLASS],
+                allowed_replace_classes=[
+                    PROJECT_WEAVIATE_CLASS,
+                    PROJECT_WEAVIATE_TEST_CLASS,
+                    PROJECT_WEAVIATE_DB_CLASS,
+                    options.weaviate_class,
+                ],
             )
             ingest_report = upsert_documents(
                 class_name=options.weaviate_class,
                 run_id=run_id,
                 docs=final_docs,
+                embedding_backend=options.embedding_backend,
+                embedding_model=options.embedding_model or None,
             )
             _write_json(paths.result / "08_weaviate_ingest_report.json", ingest_report)
             write_log(
@@ -485,6 +542,21 @@ def main() -> None:
         action="store_true",
         help="우리 프로젝트 class만 삭제 후 재생성",
     )
+    parser.add_argument(
+        "--embedding-backend",
+        type=str,
+        default=EMBEDDING_BACKEND,
+        help="임베딩 백엔드 (openai | local_sentence_transformers)",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="",
+        help=(
+            "임베딩 모델명 override. 비우면 backend 기본값 사용 "
+            f"(openai={OPENAI_EMBEDDING_MODEL}, local={LOCAL_EMBEDDING_MODEL})"
+        ),
+    )
     args = parser.parse_args()
 
     result = run_pipeline(
@@ -496,6 +568,8 @@ def main() -> None:
             ingest_weaviate=args.ingest_weaviate,
             weaviate_class=args.weaviate_class,
             replace_own_collection=args.replace_own_collection,
+            embedding_backend=args.embedding_backend,
+            embedding_model=args.embedding_model,
         )
     )
     print(f"run_root: {result['run_root']}")

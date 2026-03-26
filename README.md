@@ -7,7 +7,7 @@
 - 벡터 저장: Weaviate
 - 질의응답: FastAPI (`/v1/chat/completions`, `/regulation/chat`)
 - LLM: Ollama 계열 엔드포인트(기본 `gpt-oss-20b-128k:latest`)
-- 임베딩: OpenAI (`text-embedding-3-small`)
+- 임베딩: OpenAI 또는 로컬 sentence-transformers (`bge-m3`, `e5-large` 등)
 
 ---
 
@@ -24,12 +24,15 @@ zai-regulation/
 │  ├─ weaviate_search.py      # 검색 유틸
 │  ├─ chat_service.py         # 질의 라우팅/검색/답변 생성
 │  ├─ llm_client.py           # Ollama API 래퍼(OpenAI-like)
+│  ├─ embedding_client.py     # 임베딩 백엔드 래퍼(OpenAI/local)
+│  ├─ reembed_ingest.py       # 동일 문서 재임베딩 적재 유틸
 │  └─ config.py               # 환경/설정 로딩
 ├─ bin/
 │  ├─ run-api
 │  ├─ run-collect
 │  ├─ run-summarize
-│  └─ run-ingest
+│  ├─ run-ingest
+│  └─ run-reembed
 ├─ config/
 │  ├─ base.yaml
 │  ├─ dev.yaml
@@ -70,8 +73,10 @@ cp .env.example .env
 - `OLLAMA_BASE_URL` (예: `http://localhost:11434` 또는 사내 게이트웨이)
 - `ANSWER_MODEL` (기본: `gpt-oss-20b-128k:latest`)
 - `SUMMARIZE_MODEL` (기본: `gpt-oss-20b-128k:latest`)
-- `OPENAI_API_KEY` (임베딩용)
+- `EMBEDDING_BACKEND` (`openai` | `local_sentence_transformers`, 기본: `local_sentence_transformers`)
+- `OPENAI_API_KEY` (OpenAI 임베딩 사용 시)
 - `OPENAI_EMBEDDING_MODEL` (기본: `text-embedding-3-small`)
+- `LOCAL_EMBEDDING_MODEL` (기본: `BAAI/bge-m3`)
 - `API_PORT` (개발 기본값 예시: `8012`)
 
 ### 3-3. API 실행
@@ -95,6 +100,7 @@ bash bin/run-ingest --limit 3 --ingest-weaviate
 - `bin/run-collect`: 게시글/첨부 수집
 - `bin/run-summarize`: 수집 결과 요약
 - `bin/run-ingest`: 통합 파이프라인 실행
+- `bin/run-reembed`: 기존 요약 JSON을 임베딩만 바꿔 재적재
 
 ---
 
@@ -137,7 +143,7 @@ curl -X POST "http://localhost:${API_PORT:-8012}/v1/chat/completions" \
 2. 최신 규정 필터링(rule 기반, 옵션으로 LLM refine)
 3. 본문/첨부 수집 및 텍스트 추출
 4. 첨부 1차 요약 + 게시글 2차 통합 요약
-5. OpenAI 임베딩 생성 후 Weaviate 적재
+5. 선택한 임베딩 백엔드(OpenAI/local)로 벡터 생성 후 Weaviate 적재
 
 Run 산출물은 `data/runs/<run_id>/` 아래에 저장됩니다.
 
@@ -147,12 +153,42 @@ Run 산출물은 `data/runs/<run_id>/` 아래에 저장됩니다.
 
 - 모델 교체는 코드 수정 없이 `.env`/환경변수만 변경
 - Weaviate 클래스명은 `ZaiRegulation` prefix 정책 사용
-- 임베딩은 OpenAI 키가 필요 (`OPENAI_API_KEY`)
+- OpenAI 임베딩 사용 시에만 `OPENAI_API_KEY` 필요
 - 사내 게이트웨이 인증이 필요한 경우 `OLLAMA_API_KEY` 사용
 
 ---
 
-## 8) 개발 환경 프로파일
+## 8) 5문서 미니셋 임베딩 A/B 예시
+
+같은 문서 5개를 유지한 채 임베딩만 바꿔 비교하려면, 수집/요약을 1회 수행한 뒤 `run-reembed`를 2회 실행하세요.
+
+```bash
+# 1) 문서 5개를 수집/요약 (적재는 생략)
+bash bin/run-ingest --limit 5 --no-cleanup
+
+# 2) 위 run의 결과 JSON 경로 확인 후 재임베딩 적재
+# 예: data/runs/<run_id>/result/07_final_for_ingest.json
+
+# bge-m3 class
+bash bin/run-reembed \
+  --input-json "data/runs/<run_id>/result/07_final_for_ingest.json" \
+  --weaviate-class ZaiRegulation_db_bgem3 \
+  --replace-own-collection \
+  --embedding-backend local_sentence_transformers \
+  --embedding-model BAAI/bge-m3
+
+# e5 class
+bash bin/run-reembed \
+  --input-json "data/runs/<run_id>/result/07_final_for_ingest.json" \
+  --weaviate-class ZaiRegulation_db_e5 \
+  --replace-own-collection \
+  --embedding-backend local_sentence_transformers \
+  --embedding-model intfloat/multilingual-e5-large-instruct
+```
+
+---
+
+## 9) 개발 환경 프로파일
 
 - `APP_ENV=dev` -> `config/dev.yaml`
 - `APP_ENV=prod` -> `config/prod.yaml`

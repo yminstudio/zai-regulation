@@ -16,31 +16,31 @@ LOW_SCORE_THRESHOLD = 0.45
 RELATED_LINK_MAX_CANDIDATES = 5
 RELATED_LINK_APPEND_LIMIT = 3
 INTENT_NON_REGULATION_THRESHOLD = 0.8
-NON_REGULATION_GUIDE_LINE = "사내 규정/복리후생/휴가/경비 관련 질문을 주시면 도와드릴게요."
+NON_REGULATION_GUIDE_LINE = "저는 사규 챗봇이기에, 사규 관련 질의를 주시면 답변 드리겠습니다."
 TOPIC_LOCK_MAX_USER_TURNS = 3
 
 SYSTEM_PROMPT = """
 당신은 KG제로인의 사내규정(사규) 링크 추천 챗봇입니다.
-목표는 장문 답변이 아니라 "정확한 관련 링크 선택"입니다.
-아래 candidate_docs는 검색 시스템이 뽑은 후보이며, id/title/reg_date/summary/keywords/url이 포함됩니다.
+목표는 답변 작성이 아니라 candidate_docs에서 관련 문서 id를 정확히 고르는 것입니다.
+
+입력:
+- candidate_docs: id/title/reg_date/summary/keywords/url 포함
 
 [절대 규칙]
 1. candidate_docs에 없는 문서를 만들지 마세요.
 2. URL은 절대 생성/수정/추측하지 마세요. (id 선택만 수행)
 3. 출력은 반드시 JSON object 한 개만 반환하세요.
 4. selected_ids에는 반드시 candidate_docs의 id만 넣으세요.
-5. 관련 문서가 있으면 2~3개를 우선 선택하세요. (최대 3개)
+5. 관련 문서가 있으면 1~3개를 우선 선택하세요. (최대 3개)
 6. 동일 규정군(개정본/유사 제목)이 겹치면 최신 reg_date 문서를 우선 선택하세요.
-7. 확정적 근거가 부족하면 brief에 "관련 가능성"을 명시하세요.
 8. 질문과 명확히 무관하면 no_match=true로 반환하세요.
-9. brief는 "의도 추출 안내" 1문장만 작성하세요. (정답형 설명/해설 금지)
-10. 사용자의 질문에 대한 직접 답변(정책 해석, 결론 제시)을 작성하지 마세요.
+10. 사용자 질문에 대한 정책 해석/결론은 쓰지 않는다.
+11. 출력은 JSON object 하나만 반환한다.
 
 [출력 스키마]
 {
   "standalone_query": "다음 턴 검색에 사용할 독립 질의",
   "no_match": false,
-  "brief": "질문에서 추출한 의도(예: 출산, 지원, 대상)와 관련된 규정을 안내드립니다.",
   "selected_ids": ["doc_1", "doc_3"],
   "selection_reasons": {
     "doc_1": "짧은 근거",
@@ -101,21 +101,18 @@ KEYWORD_EXTRACT_SYSTEM_PROMPT = """
 """.strip()
 
 INTENT_KEYWORD_SYSTEM_PROMPT = """
-당신은 KG제로인 사규 챗봇의 선행 라우터이자 검색 키워드 추출기입니다.
-입력 질문을 보고 아래 두 작업을 한 번에 수행하세요.
-
-작업1) intent 분류
-- regulation: 사내 규정/규칙/기준/복리후생/휴가/경비/지급/절차/대상/조건 등 사규 문의
-- non_regulation: 일상 대화, 잡담, 사규와 무관한 일반 질문
-- 질문에 업무/복지/경조/휴가/지급/대상/조건/절차 맥락이 조금이라도 있으면 regulation으로 분류하세요.
-
-작업2) 검색 키워드 추출
-- 규정 탐색에 직접 쓰일 실질 키워드만 2~5개
-- 주변 맥락어(예: 우리, 회사, 나는, 이거, 좀)는 제외
-- 한 단어 위주, 필요시 2어절 허용
-- 정책 해석/결론은 하지 말고 키워드만 추출
-
-출력은 반드시 JSON object 한 개만 반환하세요.
+당신은 KG제로인 사내 규정 챗봇의 라우터다.
+입력 질문에 대해 의도 분류와 검색 키워드 추출을 동시에 수행한다.
+의도 라벨:
+- regulation: 사규/복리후생/휴가/경조/지급/대상/조건/절차 관련
+- non_regulation: 사규와 무관한 일반 대화
+규칙:
+1) 사규 맥락이 조금이라도 있으면 regulation으로 분류한다.
+2) keywords는 검색 실효 키워드만 2~5개 반환한다.
+3) 불필요한 맥락어(우리, 회사, 나, 이거 등)는 제외한다.
+4) 정책 해석/결론은 하지 않는다.
+5) 출력은 JSON object 하나만 반환한다.
+출력:
 {
   "intent": "regulation | non_regulation",
   "confidence": 0.0,
@@ -127,22 +124,19 @@ INTENT_KEYWORD_SYSTEM_PROMPT = """
 
 FINAL_ANSWER_WRITER_SYSTEM_PROMPT = """
 당신은 KG제로인 사규 안내 챗봇입니다.
-역할은 "선택된 문서 링크를 바탕으로, 사용자 질문에 맞는 자연스러운 안내문"을 작성하는 것입니다.
+역할은 입력으로 주어진 selected_docs만 사용해 자연스러운 안내문을 만드는 것입니다.
 
 중요:
 1) 정책 해석을 단정하지 말고, 문서에 무엇이 담겨 있는지 안내 중심으로 작성하세요.
-2) 어조는 부드럽고 자연스럽게 작성하세요. (기계적/딱딱한 문구 금지)
-3) "질문에서 추출한 의도", "관련 가능성" 같은 메타 문구는 사용하지 마세요.
-4) 각 문서 설명은 2~3문장으로, 해당 문서에 포함된 기준/절차/대상/조건을 짧게 요약하세요.
-5) 가족관계(외숙모/인척/직계/혼인계 등) 판단은 summary에 명시된 경우에만 작성하세요.
-6) 질문에 대한 결론(“가능/불가”, “지급됨/안됨”)을 단정하지 마세요.
-7) 숫자(기간/금액/비율/기한)는 summary에 있는 값만 그대로 사용하세요.   
-8) URL, 문서 id는 절대 생성하거나 수정하지 마세요. 설명문 텍스트만 작성하세요.
-9) "doc_1", "doc_2" 같은 내부 id를 사용자 노출 문장에 절대 쓰지 마세요.
-10) "인사팀에 문의", "담당부서 확인"처럼 다음 행동을 지시하는 문구는 작성하지 마세요.
-11) 출력은 반드시 JSON object 한 개만 반환하세요.
-12) 규정에 없는 절차/조직/사례를 절대 생성하지 마라
-13) 명시된 내용만 사용하라 없으면 "명시되지 않음"이라고 답하라.
+2) 어조는 부드럽고 자연스럽게 존댓말로 작성하세요. (기계적/딱딱한 문구 금지)
+3) 각 문서 설명은 2~4문장으로, 해당 문서에 포함된 기준/절차/대상/조건을 짧게 요약하세요.
+4) 가족관계(부모/인척/직계/혼인계 등) 판단은 summary에 명시된 경우에만 작성하세요.
+5) 가능/불가, 지급/미지급 같은 결론을 단정하지마세요.
+6) 숫자(기간/금액/비율/기한)는 summary에 있는 값만 그대로 사용하세요.   
+7) 내부 id(doc_1 등)를 사용자 문장에 노출하지 마세요.
+8) "인사팀 문의" 같은 행동 지시 문구는 쓰지 않는다.
+9) URL/id 생성·수정 금지.
+10) 출력은 JSON object 하나만 반환한다.
 
 출력 스키마:
 {
@@ -157,14 +151,14 @@ FINAL_ANSWER_WRITER_SYSTEM_PROMPT = """
 
 NON_REGULATION_SYSTEM_PROMPT = f"""
 당신은 KG제로인 사규 챗봇입니다.
-사규와 무관한 질문에도 친절하게 답하되, 챗봇의 역할 경계를 유지하세요.
+사규와 무관한 질문에도 친절하게 일반 답변을 제공하세요.
+
 규칙:
-1) 답변은 한국어로, 자연스럽고 이해하기 쉽게 2~5문장으로 작성합니다.
-2) 일반 상식/일상 질문은 간단히 도움되는 답변을 제공합니다.
-3) 불확실한 내용은 단정하지 말고, 가능한 범위에서만 안내합니다.
-4) 법률/노무/세무/의학 등 전문 판단이 필요한 질문은 일반 안내만 제공합니다.
-5) 사규 관련 질문으로 이어질 수 있으면 한 문장으로 부드럽게 유도합니다.
-6) 답변 마지막에 반드시 아래 문장을 그대로 추가합니다.
+1) 답변은 한국어로 답변합니다.
+2) 불확실한 내용은 단정하지 말고, 가능한 범위에서만 안내합니다.
+3) 법률/노무/세무/의학 등 전문 판단이 필요한 질문은 일반 안내만 제공합니다.
+4) 사규 관련 질문으로 이어질 수 있으면 한 문장으로 부드럽게 유도합니다.
+5) 답변 마지막에 반드시 아래 문장을 추가합니다.
    "{NON_REGULATION_GUIDE_LINE}"
 """.strip()
 
@@ -798,32 +792,13 @@ def _build_intent_notice(
     intent_terms: list[str],
     no_match: bool,
     link_count: int,
-    llm_brief: str,
 ) -> str:
-    def _is_placeholder_brief(text: str) -> bool:
-        s = (text or "").strip()
-        if not s:
-            return True
-        blocked_phrases = (
-            "사용자에게 보일",
-            "1~2문장 요약",
-            "예시",
-            "placeholder",
-            "selected_ids",
-            "no_match",
-        )
-        return any(p in s.lower() for p in blocked_phrases)
-
     terms = [str(t or "").strip() for t in intent_terms if str(t or "").strip()]
     if not terms:
         terms = _sanitize_keywords(
             re.findall(r"[0-9A-Za-z가-힣]{2,}", current_question or ""),
             max_keywords=3,
         )
-    # 톤 일관성을 위해 서버에서 자연스러운 안내문을 고정해 사용한다.
-    brief = (llm_brief or "").strip()
-    if brief and _is_placeholder_brief(brief):
-        brief = ""
     if no_match and link_count == 0:
         return "현재 질문만으로는 적용 대상을 단정하기 어려워요. 확인하려는 가족관계와 상황(예: 사망/결혼/출산)을 알려주시면 관련 규정을 정확히 안내해드릴게요."
     return "확인해볼 만한 사규를 찾아봤어요. 아래 문서부터 보시면 가장 빠르게 판단하실 수 있어요."
@@ -951,7 +926,6 @@ def _render_link_focused_answer(
     *,
     current_question: str,
     intent_terms: list[str],
-    brief: str,
     selected_ids: list[str],
     no_match: bool,
     candidate_map: dict[str, dict],
@@ -976,7 +950,6 @@ def _render_link_focused_answer(
         intent_terms=intent_terms,
         no_match=no_match,
         link_count=len(valid_ids),
-        llm_brief=brief,
     )
     lines: list[str] = [first_line]
     if valid_ids:
@@ -1383,7 +1356,6 @@ def generate_answer_json(
         parsed = _safe_json_loads(raw)
 
     standalone_query = str(parsed.get("standalone_query", decision.chosen_query))
-    brief = str(parsed.get("brief", "")).strip()
     no_match = bool(parsed.get("no_match", False))
     raw_selected = parsed.get("selected_ids", [])
     selected_ids = [str(x).strip() for x in raw_selected] if isinstance(raw_selected, list) else []
@@ -1423,7 +1395,6 @@ def generate_answer_json(
     answer = _render_link_focused_answer(
         current_question=current_question,
         intent_terms=decision.extracted_keywords,
-        brief=brief,
         selected_ids=selected_ids,
         no_match=no_match,
         candidate_map=candidate_map,

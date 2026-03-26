@@ -65,6 +65,11 @@ def _get_path(name: str, default_relative: str) -> Path:
     return p if p.is_absolute() else PROJECT_ROOT / p
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = str(_get(name, "true" if default else "false")).strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
 _load_dotenv_files()
 APP_ENV, CONFIG_PATH, _YAML_CONFIG = _resolve_config()
 
@@ -75,12 +80,18 @@ OLLAMA_API_KEY: str = str(_get("OLLAMA_API_KEY", "")).strip()
 SUMMARIZE_MODEL: str = str(_get("SUMMARIZE_MODEL", "gpt-oss-20b-128k:latest")).strip()
 ANSWER_MODEL: str = str(_get("ANSWER_MODEL", "gpt-oss-20b-128k:latest")).strip()
 
-# --- Embedding (OpenAI) ---
-# 임베딩은 OpenAI 전용으로 분리 운영한다.
+# --- Embedding ---
+# 백엔드는 openai 또는 local_sentence_transformers 중 선택한다.
+EMBEDDING_BACKEND: str = str(_get("EMBEDDING_BACKEND", "local_sentence_transformers")).strip().lower()
 OPENAI_API_KEY: str = str(_get("OPENAI_API_KEY", "")).strip()
 OPENAI_EMBEDDING_MODEL: str = str(
     _get("OPENAI_EMBEDDING_MODEL", _get("EMBEDDING_MODEL", "text-embedding-3-small"))
 ).strip()
+LOCAL_EMBEDDING_MODEL: str = str(
+    _get("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3")
+).strip()
+LOCAL_EMBEDDING_DEVICE: str = str(_get("LOCAL_EMBEDDING_DEVICE", "")).strip()
+LOCAL_EMBEDDING_NORMALIZE: bool = _get_bool("LOCAL_EMBEDDING_NORMALIZE", True)
 
 # --- Groupware ---
 GW_USER_ID: str = str(_get("GW_USER_ID", "")).strip()
@@ -92,6 +103,7 @@ GW_BOARD_FOLDER_ID: str = str(_get("GW_BOARD_FOLDER_ID", "8233")).strip()
 WEAVIATE_URL: str = str(_get("WEAVIATE_URL", "http://localhost:8080")).strip()
 PROJECT_WEAVIATE_CLASS: str = str(_get("PROJECT_WEAVIATE_CLASS", "ZaiRegulation")).strip()
 PROJECT_WEAVIATE_TEST_CLASS: str = str(_get("PROJECT_WEAVIATE_TEST_CLASS", "ZaiRegulation_test")).strip()
+PROJECT_WEAVIATE_DB_CLASS: str = str(_get("PROJECT_WEAVIATE_DB_CLASS", "ZaiRegulation_db")).strip()
 
 # --- Paths ---
 DATA_DIR: Path = _get_path("DATA_DIR", "data")

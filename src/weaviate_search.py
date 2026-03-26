@@ -5,9 +5,9 @@ import json
 from dataclasses import dataclass
 
 import requests
-from openai import OpenAI
 
-from src.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL, PROJECT_WEAVIATE_CLASS, WEAVIATE_URL
+from src.config import PROJECT_WEAVIATE_CLASS, WEAVIATE_URL
+from src.embedding_client import embed_query
 
 
 @dataclass
@@ -33,14 +33,6 @@ class SearchResult:
     @property
     def top_score(self) -> float:
         return self.hits[0].score if self.hits else 0.0
-
-
-def _embed_query(query: str) -> list[float]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing for embedding")
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
-    resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=query)
-    return resp.data[0].embedding
 
 
 def _build_graphql(class_name: str, vector: list[float], limit: int) -> str:
@@ -112,12 +104,19 @@ def _parse_hits(items: list[dict]) -> list[SearchHit]:
     return hits
 
 
-def vector_search(query: str, *, limit: int = 5, class_name: str = PROJECT_WEAVIATE_CLASS) -> SearchResult:
+def vector_search(
+    query: str,
+    *,
+    limit: int = 5,
+    class_name: str = PROJECT_WEAVIATE_CLASS,
+    embedding_backend: str | None = None,
+    embedding_model: str | None = None,
+) -> SearchResult:
     query = (query or "").strip()
     if not query:
         return SearchResult(query=query, hits=[])
 
-    vector = _embed_query(query)
+    vector, _backend, _model = embed_query(query, backend=embedding_backend, model=embedding_model)
     gql = _build_graphql(class_name, vector, limit)
     url = f"{WEAVIATE_URL.rstrip('/')}/v1/graphql"
     resp = requests.post(url, json={"query": gql}, timeout=60)
@@ -136,12 +135,14 @@ def hybrid_search(
     class_name: str = PROJECT_WEAVIATE_CLASS,
     alpha: float = 0.35,
     autocut: int = 2,
+    embedding_backend: str | None = None,
+    embedding_model: str | None = None,
 ) -> SearchResult:
     query = (query or "").strip()
     if not query:
         return SearchResult(query=query, hits=[], mode="hybrid")
 
-    vector = _embed_query(query)
+    vector, _backend, _model = embed_query(query, backend=embedding_backend, model=embedding_model)
     gql = _build_hybrid_graphql(
         class_name,
         query_text=query,
@@ -166,10 +167,26 @@ def search_with_fallback(
     class_name: str = PROJECT_WEAVIATE_CLASS,
     alpha: float = 0.35,
     autocut: int = 2,
+    embedding_backend: str | None = None,
+    embedding_model: str | None = None,
 ) -> SearchResult:
     """기본은 hybrid, 실패 시 vector fallback."""
     try:
-        return hybrid_search(query, limit=limit, class_name=class_name, alpha=alpha, autocut=autocut)
+        return hybrid_search(
+            query,
+            limit=limit,
+            class_name=class_name,
+            alpha=alpha,
+            autocut=autocut,
+            embedding_backend=embedding_backend,
+            embedding_model=embedding_model,
+        )
     except Exception:
-        return vector_search(query, limit=limit, class_name=class_name)
+        return vector_search(
+            query,
+            limit=limit,
+            class_name=class_name,
+            embedding_backend=embedding_backend,
+            embedding_model=embedding_model,
+        )
 

@@ -4,12 +4,11 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import Iterable
 
 import requests
-from openai import OpenAI
 
-from src.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL, WEAVIATE_URL
+from src.config import WEAVIATE_URL
+from src.embedding_client import embed_texts
 
 ALLOWED_CLASS_PREFIX = "ZaiRegulation"
 
@@ -81,6 +80,8 @@ def _create_schema(class_name: str) -> None:
             {"name": "summary_keywords", "dataType": ["text[]"]},
             {"name": "rule_names", "dataType": ["text[]"]},
             {"name": "embedding_text", "dataType": ["text"]},
+            {"name": "embedding_backend", "dataType": ["text"]},
+            {"name": "embedding_model", "dataType": ["text"]},
             {"name": "run_id", "dataType": ["text"]},
             {"name": "ingested_at", "dataType": ["date"]},
         ],
@@ -115,6 +116,8 @@ def ensure_collection(
         class_name,
         properties=[
             {"name": "rule_names", "dataType": ["text[]"]},
+            {"name": "embedding_backend", "dataType": ["text"]},
+            {"name": "embedding_model", "dataType": ["text"]},
         ],
     )
 
@@ -158,31 +161,21 @@ def _to_rfc3339_date(value: str) -> str:
     return s
 
 
-def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
-    for i in range(0, len(values), size):
-        yield values[i : i + size]
-
-
-def _embed_texts(texts: list[str]) -> list[list[float]]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing for embedding")
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
-    vectors: list[list[float]] = []
-    for chunk in _chunks(texts, 32):
-        resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=chunk)
-        vectors.extend([d.embedding for d in resp.data])
-    return vectors
-
-
 def upsert_documents(
     *,
     class_name: str,
     run_id: str,
     docs: list[dict],
+    embedding_backend: str | None = None,
+    embedding_model: str | None = None,
 ) -> dict:
     class_name = _safe_class_name(class_name)
     embedding_texts = [_build_embedding_text(doc) for doc in docs]
-    vectors = _embed_texts(embedding_texts)
+    vectors, resolved_backend, resolved_model = embed_texts(
+        embedding_texts,
+        backend=embedding_backend,
+        model=embedding_model,
+    )
 
     objects = []
     for doc, vec, emb_text in zip(docs, vectors, embedding_texts):
@@ -199,6 +192,8 @@ def upsert_documents(
             "summary_keywords": doc.get("summary_keywords", []),
             "rule_names": _extract_rule_names(str(doc.get("title", ""))),
             "embedding_text": emb_text,
+            "embedding_backend": resolved_backend,
+            "embedding_model": resolved_model,
             "run_id": run_id,
             "ingested_at": _utc_now(),
         }
@@ -232,5 +227,7 @@ def upsert_documents(
         "input_count": len(docs),
         "error_count": errors,
         "errors": error_details,
+        "embedding_backend": resolved_backend,
+        "embedding_model": resolved_model,
     }
 

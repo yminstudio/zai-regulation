@@ -4,6 +4,9 @@ OLLAMA_BASE_URL: https://ai.zeroin.co.kr/dev
 SUMMARIZE_MODEL: gpt-oss-20b-128k:latest
 ANSWER_MODEL: gpt-oss-20b-128k:latest
 OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+EMBEDDING_BACKEND: local_sentence_transformers
+LOCAL_EMBEDDING_MODEL: BAAI/bge-m3
+LOCAL_EMBEDDING_NORMALIZE: true
 
 GW_BASE_URL: https://gw.kggroup.co.kr
 GW_BOARD_FOLDER_ID: "8233"
@@ -11,6 +14,7 @@ GW_BOARD_FOLDER_ID: "8233"
 WEAVIATE_URL: http://localhost:8080
 PROJECT_WEAVIATE_CLASS: ZaiRegulation
 PROJECT_WEAVIATE_TEST_CLASS: ZaiRegulation_test
+PROJECT_WEAVIATE_DB_CLASS: ZaiRegulation_db
 
 DATA_DIR: data
 LOG_DIR: logs
