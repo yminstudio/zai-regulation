@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 
-from openai import OpenAI
-
-from src.config import DATA_DIR, OPENAI_API_KEY, SUMMARIZE_MODEL
+from src.config import DATA_DIR, SUMMARIZE_MODEL
 from src.extractors import extract_text
+from src.llm_client import LLMClient
 
 INPUT_PATH = DATA_DIR / "regulation_schema_seed.json"
 OUTPUT_PATH = DATA_DIR / "regulation_texts_and_summaries.json"
@@ -39,6 +39,7 @@ FIRST_STAGE_SYSTEM_PROMPT = """
 7. 문장을 지나치게 축약하지 말고 **핵심 규정 내용이 충분히 남도록 요약**하세요.
 8. 불필요한 서론 없이 바로 규정 내용을 설명하세요.
 9. 문단 수는 제한하지 않지만 **핵심 규정 기준이 빠지지 않도록 작성**하세요.
+10. 첨부파일 원문에 없는 게시글 공지성 정보(예: 신청일/승인일, 완료 여부, 신고 진행상황)는 요약에 포함하지 마세요.
 
 목표:
 이 요약만 읽어도 해당 첨부파일이 어떤 규정이며
@@ -53,9 +54,6 @@ FIRST_STAGE_USER_TEMPLATE = """
 
 첨부파일명:
 {file_name}
-
-게시글 본문(참고용):
-{source_text}
 
 첨부파일 원문:
 {file_text}
@@ -78,6 +76,7 @@ FIRST_STAGE_USER_TEMPLATE = """
 - 규정에서 정의된 주요 항목(예: 출장비, 식대, 교통비 등)은 구분하여 설명하세요.
 - 별첨이나 기준표가 있으면 어떤 기준을 담고 있는지 요약하세요.
 - 다른 첨부파일과의 관계를 단정하지 마세요.
+- 첨부파일 원문에 없는 신청/승인 날짜 사례를 임의로 추가하지 마세요.
 
 출력 형식(반드시 아래 형식으로만 출력하세요):
 SUMMARY:
@@ -105,6 +104,7 @@ SECOND_STAGE_SYSTEM_PROMPT = """
 7. 문서에 없는 내용을 추측하지 마세요.
 8. 출력은 plain text 하나의 완성된 설명문으로만 작성하세요.
 9. 사람이 읽어도 자연스럽고, 벡터 검색에도 잘 걸릴 수 있도록 정보량 있게 작성하세요.
+10. 게시글 본문의 공지성 진행정보(예: 신청/승인 일자, 완료 보고, 장소 안내, 서명 절차)는 규정 조항으로 단정하지 말고 핵심 규정 요약에서 우선 제외하세요.
 """.strip()
 
 SECOND_STAGE_USER_TEMPLATE = """
@@ -133,7 +133,7 @@ file_info:
 """.strip()
 
 
-def _chat(client: OpenAI, system: str, user: str) -> str:
+def _chat(client: LLMClient, system: str, user: str) -> str:
     if not user.strip():
         return ""
     resp = client.chat.completions.create(
@@ -171,10 +171,9 @@ def _parse_file_summary_response(raw: str) -> tuple[str, list[str]]:
 
 
 def _file_summary(
-    client: OpenAI,
+    client: LLMClient,
     *,
     title: str,
-    source_text: str,
     file_name: str,
     file_text: str,
 ) -> tuple[str, list[str]]:
@@ -184,24 +183,52 @@ def _file_summary(
     user = FIRST_STAGE_USER_TEMPLATE.format(
         title=(title or "")[:2000],
         file_name=(file_name or "")[:1000],
-        source_text=(source_text or "")[:4000],
         file_text=(file_text or "")[:12000],
     )
     raw = _chat(client, FIRST_STAGE_SYSTEM_PROMPT, user)
     return _parse_file_summary_response(raw)
 
 
+def _sanitize_source_text_for_summary(source_text: str) -> str:
+    """게시글 본문의 공지성/처리현황 문구를 줄여 요약 오염을 완화한다."""
+    src = (source_text or "").strip()
+    if not src:
+        return ""
+    blocked_patterns = (
+        r"고용노동부\s*승인여부",
+        r"\b승인여부\b",
+        r"\b신청\s*:\s*",
+        r"\b승인\s*:\s*",
+        r"인장날인석",
+        r"동의서\s*내용\s*확인",
+        r"근로자\s*과반수\s*이상\s*동의\s*안내",
+    )
+    kept_lines: list[str] = []
+    for raw_line in src.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(re.search(pat, line, flags=re.IGNORECASE) for pat in blocked_patterns):
+            continue
+        kept_lines.append(line)
+    merged = "\n".join(kept_lines).strip()
+    if not merged:
+        return ""
+    return merged[:3000]
+
+
 def _doc_summary(
-    client: OpenAI,
+    client: LLMClient,
     *,
     title: str,
     source_text: str,
     file_info: list[dict],
 ) -> str:
     file_info_json = json.dumps(file_info, ensure_ascii=False, indent=2)
+    safe_source_text = _sanitize_source_text_for_summary(source_text)
     user = SECOND_STAGE_USER_TEMPLATE.format(
         title=(title or "")[:2000],
-        source_text=(source_text or "")[:6000],
+        source_text=safe_source_text,
         file_info_json=file_info_json[:10000],
     )
     return _chat(client, SECOND_STAGE_SYSTEM_PROMPT, user)
@@ -216,7 +243,7 @@ def main() -> None:
     if args.limit and args.limit > 0:
         docs = docs[: args.limit]
 
-    client = OpenAI(api_key=(OPENAI_API_KEY or "").strip(), timeout=120.0)
+    client = LLMClient(timeout=120.0)
 
     out_docs: list[dict] = []
     for doc in docs:
@@ -235,7 +262,6 @@ def main() -> None:
             file_summary, file_keywords = _file_summary(
                 client,
                 title=doc.get("title", "") or "",
-                source_text=source_text,
                 file_name=name,
                 file_text=text,
             )

@@ -1,0 +1,3 @@
+# 운영 환경 오버라이드 예시
+# 필요 시 운영 Weaviate class, URL 등을 여기에 선언하세요.
+APP_NAME: zai-regulation-prod

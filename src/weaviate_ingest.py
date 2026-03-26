@@ -9,7 +9,7 @@ from typing import Iterable
 import requests
 from openai import OpenAI
 
-from src.config import EMBEDDING_MODEL, OPENAI_API_KEY, WEAVIATE_URL
+from src.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL, WEAVIATE_URL
 
 ALLOWED_CLASS_PREFIX = "ZaiRegulation"
 
@@ -165,11 +165,11 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
+        raise RuntimeError("OPENAI_API_KEY is missing for embedding")
     client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
     vectors: list[list[float]] = []
     for chunk in _chunks(texts, 32):
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=chunk)
+        resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=chunk)
         vectors.extend([d.embedding for d in resp.data])
     return vectors
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import requests
 from openai import OpenAI
 
-from src.config import EMBEDDING_MODEL, OPENAI_API_KEY, PROJECT_WEAVIATE_CLASS, WEAVIATE_URL
+from src.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL, PROJECT_WEAVIATE_CLASS, WEAVIATE_URL
 
 
 @dataclass
@@ -37,9 +37,9 @@ class SearchResult:
 
 def _embed_query(query: str) -> list[float]:
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
+        raise RuntimeError("OPENAI_API_KEY is missing for embedding")
     client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
-    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=query)
+    resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=query)
     return resp.data[0].embedding
 
 

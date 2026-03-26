@@ -14,11 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from openai import OpenAI
-
 from src.config import (
     DATA_DIR,
-    OPENAI_API_KEY,
     PROJECT_WEAVIATE_CLASS,
     PROJECT_WEAVIATE_TEST_CLASS,
 )
@@ -27,6 +24,7 @@ from src.filter_latest import llm_refine_filter, rule_based_filter
 from src.gw_downloader import GWDownloader
 from src.gw_list_fetcher import fetch_board_list
 from src.log_utils import write_log
+from src.llm_client import LLMClient
 from src.summarize_documents import _doc_summary, _file_summary
 from src.weaviate_ingest import ensure_collection, upsert_documents
 
@@ -295,7 +293,7 @@ def collect_and_filter(
 
 
 def summarize_docs(*, paths: RunPaths, docs: list[dict]) -> list[dict]:
-    client = OpenAI(api_key=(OPENAI_API_KEY or "").strip(), timeout=120.0)
+    client = LLMClient(timeout=120.0)
     out_docs: list[dict] = []
 
     for doc in docs:
@@ -313,7 +311,6 @@ def summarize_docs(*, paths: RunPaths, docs: list[dict]) -> list[dict]:
             file_summary, file_keywords = _file_summary(
                 client,
                 title=doc.get("title", "") or "",
-                source_text=source_text,
                 file_name=name,
                 file_text=file_text,
             )

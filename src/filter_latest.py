@@ -6,9 +6,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from openai import OpenAI
-
-from src.config import OPENAI_API_KEY, SUMMARIZE_MODEL
+from src.config import SUMMARIZE_MODEL
+from src.llm_client import LLMClient
 
 DATE_PATTERNS = [
     r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}",
@@ -200,10 +199,7 @@ def llm_refine_filter(board_list: list[dict], *, use_llm: bool = True) -> Filter
     if not use_llm:
         return baseline
 
-    if not OPENAI_API_KEY:
-        return baseline
-
-    client = OpenAI(api_key=OPENAI_API_KEY, timeout=120.0)
+    client = LLMClient(timeout=120.0)
     user_prompt = USER_PROMPT_TEMPLATE.replace(
         "{{BOARD_LIST_JSON}}",
         json.dumps(board_list, ensure_ascii=False, indent=2),

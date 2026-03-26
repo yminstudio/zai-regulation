@@ -1,39 +1,100 @@
 """프로젝트 전역 설정 모듈.
 
-.venv/.env 파일에서 기밀 값(API 키, 로그인 정보 등)을 로딩하고
-프로젝트 전체에서 참조할 수 있도록 제공합니다.
+설정 우선순위(높음 -> 낮음):
+1) OS 환경변수
+2) .env / .venv/.env
+3) config/<env>.yaml
+4) config/base.yaml
+5) 코드 기본값
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VENV_ENV_PATH = PROJECT_ROOT / ".venv" / ".env"
+CONFIG_DIR = PROJECT_ROOT / "config"
+DEFAULT_ENV = "dev"
 
-load_dotenv(VENV_ENV_PATH)
 
-# --- OpenAI ---
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-SUMMARIZE_MODEL: str = os.getenv("SUMMARIZE_MODEL", "gpt-5.4-nano")
-ANSWER_MODEL: str = os.getenv("ANSWER_MODEL", "gpt-5.4-nano")
+def _load_dotenv_files() -> None:
+    # 기존 하위호환(.venv/.env) + 표준(.env) 모두 지원한다.
+    for env_path in (PROJECT_ROOT / ".venv" / ".env", PROJECT_ROOT / ".env"):
+        if env_path.exists():
+            load_dotenv(env_path)
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _resolve_config() -> tuple[str, Path, dict[str, Any]]:
+    config_env = (os.getenv("APP_ENV") or DEFAULT_ENV).strip() or DEFAULT_ENV
+    config_file = os.getenv("CONFIG_FILE", "").strip()
+    if config_file:
+        file_path = Path(config_file)
+        if not file_path.is_absolute():
+            file_path = PROJECT_ROOT / file_path
+        return config_env, file_path, _read_yaml(file_path)
+
+    base_path = CONFIG_DIR / "base.yaml"
+    env_path = CONFIG_DIR / f"{config_env}.yaml"
+    merged = {}
+    merged.update(_read_yaml(base_path))
+    merged.update(_read_yaml(env_path))
+    return config_env, env_path, merged
+
+
+def _get(name: str, default: Any) -> Any:
+    raw = os.getenv(name)
+    if raw is not None and raw != "":
+        return raw
+    return _YAML_CONFIG.get(name, default)
+
+
+def _get_path(name: str, default_relative: str) -> Path:
+    raw = str(_get(name, default_relative)).strip()
+    p = Path(raw)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
+_load_dotenv_files()
+APP_ENV, CONFIG_PATH, _YAML_CONFIG = _resolve_config()
+
+# --- LLM (Ollama) ---
+# 모델/엔드포인트는 코드가 아니라 환경변수(.env)로만 변경한다.
+OLLAMA_BASE_URL: str = str(_get("OLLAMA_BASE_URL", "http://localhost:11434")).strip()
+OLLAMA_API_KEY: str = str(_get("OLLAMA_API_KEY", "")).strip()
+SUMMARIZE_MODEL: str = str(_get("SUMMARIZE_MODEL", "gpt-oss-20b-128k:latest")).strip()
+ANSWER_MODEL: str = str(_get("ANSWER_MODEL", "gpt-oss-20b-128k:latest")).strip()
+
+# --- Embedding (OpenAI) ---
+# 임베딩은 OpenAI 전용으로 분리 운영한다.
+OPENAI_API_KEY: str = str(_get("OPENAI_API_KEY", "")).strip()
+OPENAI_EMBEDDING_MODEL: str = str(
+    _get("OPENAI_EMBEDDING_MODEL", _get("EMBEDDING_MODEL", "text-embedding-3-small"))
+).strip()
 
 # --- Groupware ---
-GW_USER_ID: str = os.getenv("GW_USER_ID", "")
-GW_PASSWORD: str = os.getenv("GW_PASSWORD", "")
-GW_BASE_URL: str = os.getenv("GW_BASE_URL", "https://gw.kggroup.co.kr")
-GW_BOARD_FOLDER_ID: str = os.getenv("GW_BOARD_FOLDER_ID", "8233")
+GW_USER_ID: str = str(_get("GW_USER_ID", "")).strip()
+GW_PASSWORD: str = str(_get("GW_PASSWORD", "")).strip()
+GW_BASE_URL: str = str(_get("GW_BASE_URL", "https://gw.kggroup.co.kr")).strip()
+GW_BOARD_FOLDER_ID: str = str(_get("GW_BOARD_FOLDER_ID", "8233")).strip()
 
 # --- Weaviate ---
-WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "http://localhost:8080")
-PROJECT_WEAVIATE_CLASS: str = os.getenv("PROJECT_WEAVIATE_CLASS", "ZaiRegulation")
-PROJECT_WEAVIATE_TEST_CLASS: str = os.getenv("PROJECT_WEAVIATE_TEST_CLASS", "ZaiRegulation_test")
+WEAVIATE_URL: str = str(_get("WEAVIATE_URL", "http://localhost:8080")).strip()
+PROJECT_WEAVIATE_CLASS: str = str(_get("PROJECT_WEAVIATE_CLASS", "ZaiRegulation")).strip()
+PROJECT_WEAVIATE_TEST_CLASS: str = str(_get("PROJECT_WEAVIATE_TEST_CLASS", "ZaiRegulation_test")).strip()
 
 # --- Paths ---
-DATA_DIR: Path = PROJECT_ROOT / "data"
-LOG_DIR: Path = PROJECT_ROOT / "logs"
+DATA_DIR: Path = _get_path("DATA_DIR", "data")
+LOG_DIR: Path = _get_path("LOG_DIR", "logs")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)

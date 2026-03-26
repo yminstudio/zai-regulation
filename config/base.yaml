@@ -1,0 +1,16 @@
+# LLM endpoint/model은 운영 시 환경변수로 override 권장
+# OLLAMA_BASE_URL: http://localhost:11434
+OLLAMA_BASE_URL: https://ai.zeroin.co.kr/dev
+SUMMARIZE_MODEL: gpt-oss-20b-128k:latest
+ANSWER_MODEL: gpt-oss-20b-128k:latest
+OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+
+GW_BASE_URL: https://gw.kggroup.co.kr
+GW_BOARD_FOLDER_ID: "8233"
+
+WEAVIATE_URL: http://localhost:8080
+PROJECT_WEAVIATE_CLASS: ZaiRegulation
+PROJECT_WEAVIATE_TEST_CLASS: ZaiRegulation_test
+
+DATA_DIR: data
+LOG_DIR: logs
