@@ -6,9 +6,8 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 
-from openai import OpenAI
-
-from src.config import ANSWER_MODEL, OPENAI_API_KEY
+from src.config import ANSWER_MODEL
+from src.llm_client import LLMClient
 from src.weaviate_search import SearchHit, SearchResult, search_with_fallback
 
 SEARCH_FETCH_LIMIT = 30
@@ -50,6 +49,8 @@ SYSTEM_PROMPT = """
 }
 """.strip()
 
+
+# 얘는 이제 쓰지 않음 이유는 이미 위에 있는 규칙에 의해 처리되기 때문임. (INTENT_KEYWORD_SYSTEM_PROMPT)
 INTENT_SYSTEM_PROMPT = """
 당신은 KG제로인 사규 챗봇의 선행 라우터입니다.
 입력 질문을 아래 2개 라벨 중 하나로 분류하세요.
@@ -58,9 +59,10 @@ INTENT_SYSTEM_PROMPT = """
 - non_regulation: 일상 대화, 잡담, 사규와 무관한 일반 질문
 
 중요 규칙:
-1) 애매하면 반드시 regulation으로 분류하세요. (보수 정책)
-2) 출력은 JSON object 한 개만 반환하세요.
-3) confidence는 0.0~1.0 사이 실수로 반환하세요.
+1) non_regulation은 "사규와 무관함이 명확한 경우"에만 선택하세요.
+2) 질문에 규정/복지/휴가/경조/지급/대상/조건/절차 등 업무 맥락이 조금이라도 있으면 regulation으로 분류하세요.
+3) 출력은 JSON object 한 개만 반환하세요.
+4) confidence는 0.0~1.0 사이 실수로 반환하세요.
 
 출력 스키마:
 {
@@ -98,6 +100,31 @@ KEYWORD_EXTRACT_SYSTEM_PROMPT = """
 }
 """.strip()
 
+INTENT_KEYWORD_SYSTEM_PROMPT = """
+당신은 KG제로인 사규 챗봇의 선행 라우터이자 검색 키워드 추출기입니다.
+입력 질문을 보고 아래 두 작업을 한 번에 수행하세요.
+
+작업1) intent 분류
+- regulation: 사내 규정/규칙/기준/복리후생/휴가/경비/지급/절차/대상/조건 등 사규 문의
+- non_regulation: 일상 대화, 잡담, 사규와 무관한 일반 질문
+- 질문에 업무/복지/경조/휴가/지급/대상/조건/절차 맥락이 조금이라도 있으면 regulation으로 분류하세요.
+
+작업2) 검색 키워드 추출
+- 규정 탐색에 직접 쓰일 실질 키워드만 2~5개
+- 주변 맥락어(예: 우리, 회사, 나는, 이거, 좀)는 제외
+- 한 단어 위주, 필요시 2어절 허용
+- 정책 해석/결론은 하지 말고 키워드만 추출
+
+출력은 반드시 JSON object 한 개만 반환하세요.
+{
+  "intent": "regulation | non_regulation",
+  "confidence": 0.0,
+  "intent_reason": "짧은 근거",
+  "keywords": ["키워드1", "키워드2"],
+  "keyword_reason": "짧은 근거"
+}
+""".strip()
+
 FINAL_ANSWER_WRITER_SYSTEM_PROMPT = """
 당신은 KG제로인 사규 안내 챗봇입니다.
 역할은 "선택된 문서 링크를 바탕으로, 사용자 질문에 맞는 자연스러운 안내문"을 작성하는 것입니다.
@@ -106,10 +133,16 @@ FINAL_ANSWER_WRITER_SYSTEM_PROMPT = """
 1) 정책 해석을 단정하지 말고, 문서에 무엇이 담겨 있는지 안내 중심으로 작성하세요.
 2) 어조는 부드럽고 자연스럽게 작성하세요. (기계적/딱딱한 문구 금지)
 3) "질문에서 추출한 의도", "관련 가능성" 같은 메타 문구는 사용하지 마세요.
-4) 각 문서 설명은 1~2문장으로, 해당 문서에 포함된 기준/절차/대상/조건을 짧게 요약하세요.
-5) URL, 문서 id는 절대 생성하거나 수정하지 마세요. 설명문 텍스트만 작성하세요.
-6) "doc_1", "doc_2" 같은 내부 id를 사용자 노출 문장에 절대 쓰지 마세요.
-6) 출력은 반드시 JSON object 한 개만 반환하세요.
+4) 각 문서 설명은 2~3문장으로, 해당 문서에 포함된 기준/절차/대상/조건을 짧게 요약하세요.
+5) 가족관계(외숙모/인척/직계/혼인계 등) 판단은 summary에 명시된 경우에만 작성하세요.
+6) 질문에 대한 결론(“가능/불가”, “지급됨/안됨”)을 단정하지 마세요.
+7) 숫자(기간/금액/비율/기한)는 summary에 있는 값만 그대로 사용하세요.   
+8) URL, 문서 id는 절대 생성하거나 수정하지 마세요. 설명문 텍스트만 작성하세요.
+9) "doc_1", "doc_2" 같은 내부 id를 사용자 노출 문장에 절대 쓰지 마세요.
+10) "인사팀에 문의", "담당부서 확인"처럼 다음 행동을 지시하는 문구는 작성하지 마세요.
+11) 출력은 반드시 JSON object 한 개만 반환하세요.
+12) 규정에 없는 절차/조직/사례를 절대 생성하지 마라
+13) 명시된 내용만 사용하라 없으면 "명시되지 않음"이라고 답하라.
 
 출력 스키마:
 {
@@ -211,44 +244,102 @@ def _clamp_confidence(value: object) -> float:
 
 
 def classify_intent(question: str) -> IntentDecision:
+    intent_decision, _keyword_decision = classify_intent_and_keywords(question)
+    return intent_decision
+
+
+def classify_intent_and_keywords(
+    question: str,
+    *,
+    max_keywords: int = 5,
+) -> tuple[IntentDecision, KeywordExtractionDecision]:
     q = (question or "").strip()
     if not q:
-        return IntentDecision(intent="regulation", confidence=0.0, reason="empty_question")
+        return (
+            IntentDecision(intent="regulation", confidence=0.0, reason="empty_question"),
+            KeywordExtractionDecision(
+                raw_keywords=[],
+                cleaned_keywords=[],
+                source="empty_question",
+                reason="empty_question",
+            ),
+        )
     if _is_meta_task_prompt(q):
         # OpenWebUI 보조 태스크 프롬프트는 사규 검색 파이프라인에서 제외한다.
-        return IntentDecision(intent="non_regulation", confidence=1.0, reason="meta_task_prompt_guard")
-    if not OPENAI_API_KEY:
-        # 키가 없더라도 기본 라우팅은 regulation으로 유지
-        return IntentDecision(intent="regulation", confidence=0.0, reason="missing_api_key")
+        return (
+            IntentDecision(intent="non_regulation", confidence=1.0, reason="meta_task_prompt_guard"),
+            KeywordExtractionDecision(
+                raw_keywords=[],
+                cleaned_keywords=[],
+                source="meta_task_prompt_guard",
+                reason="meta_task_prompt_guard",
+            ),
+        )
+    client = LLMClient(timeout=60.0)
+    llm_reason = "no_reason"
+    llm_raw_keywords: list[str] = []
+    try:
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[
+                {"role": "system", "content": INTENT_KEYWORD_SYSTEM_PROMPT},
+                {"role": "user", "content": q},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _safe_json_loads(raw)
+        raw_intent = str(parsed.get("intent", "regulation")).strip().lower()
+        confidence = _clamp_confidence(parsed.get("confidence", 0.0))
+        intent_reason = str(parsed.get("intent_reason", parsed.get("reason", ""))).strip() or "no_reason"
+        llm_reason = str(parsed.get("keyword_reason", "")).strip() or "no_reason"
+        keywords_raw = parsed.get("keywords", [])
+        if isinstance(keywords_raw, list):
+            llm_raw_keywords = [str(x or "").strip() for x in keywords_raw if str(x or "").strip()]
+        cleaned = _sanitize_keywords(llm_raw_keywords, max_keywords=max_keywords)
 
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
-    resp = client.chat.completions.create(
-        model=ANSWER_MODEL,
-        messages=[
-            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-            {"role": "user", "content": q},
-        ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
-    raw = (resp.choices[0].message.content or "").strip()
-    parsed = _safe_json_loads(raw)
-    raw_intent = str(parsed.get("intent", "regulation")).strip().lower()
-    confidence = _clamp_confidence(parsed.get("confidence", 0.0))
-    reason = str(parsed.get("reason", "")).strip() or "no_reason"
+        intent = "non_regulation" if raw_intent == "non_regulation" else "regulation"
+        if cleaned:
+            return (
+                IntentDecision(intent=intent, confidence=confidence, reason=intent_reason),
+                KeywordExtractionDecision(
+                    raw_keywords=llm_raw_keywords,
+                    cleaned_keywords=cleaned,
+                    source="llm_combined",
+                    reason=llm_reason,
+                ),
+            )
 
-    intent = "non_regulation" if raw_intent == "non_regulation" else "regulation"
-    return IntentDecision(intent=intent, confidence=confidence, reason=reason)
+        heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
+        return (
+            IntentDecision(intent=intent, confidence=confidence, reason=intent_reason),
+            KeywordExtractionDecision(
+                raw_keywords=llm_raw_keywords or heuristic,
+                cleaned_keywords=heuristic,
+                source="heuristic_llm_fallback",
+                reason=llm_reason,
+            ),
+        )
+    except Exception as e:
+        llm_reason = f"llm_error:{type(e).__name__}"
+        heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
+        return (
+            IntentDecision(intent="regulation", confidence=0.0, reason=llm_reason),
+            KeywordExtractionDecision(
+                raw_keywords=heuristic,
+                cleaned_keywords=heuristic,
+                source="heuristic_llm_fallback",
+                reason=llm_reason,
+            ),
+        )
 
 
 def generate_non_regulation_answer(question: str) -> str:
     q = (question or "").strip()
     if not q:
         return NON_REGULATION_GUIDE_LINE
-    if not OPENAI_API_KEY:
-        return NON_REGULATION_GUIDE_LINE
-
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
+    client = LLMClient(timeout=60.0)
     try:
         resp = client.chat.completions.create(
             model=ANSWER_MODEL,
@@ -433,60 +524,51 @@ def _heuristic_regulation_keywords(question: str, *, max_keywords: int = 5) -> l
     return _sanitize_keywords(ordered, max_keywords=max_keywords)
 
 
-def extract_regulation_keywords(question: str, *, max_keywords: int = 5) -> KeywordExtractionDecision:
-    q = _strip_embedded_chat_history(question)
+def _augment_event_keywords(question: str, extracted_keywords: list[str], *, max_keywords: int = 7) -> list[str]:
+    """질문 표면어 기반으로 경조/친족 이벤트 키워드를 보강한다."""
+    q = (question or "").strip().lower()
     if not q:
-        return KeywordExtractionDecision(
-            raw_keywords=[],
-            cleaned_keywords=[],
-            source="empty_question",
-            reason="empty_question",
-        )
-    if not OPENAI_API_KEY:
-        heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
-        return KeywordExtractionDecision(
-            raw_keywords=heuristic,
-            cleaned_keywords=heuristic,
-            source="heuristic_missing_api_key",
-            reason="missing_api_key",
-        )
+        return _sanitize_keywords(extracted_keywords, max_keywords=max_keywords)
 
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=60.0)
-    llm_reason = "no_reason"
-    llm_raw_keywords: list[str] = []
-    try:
-        resp = client.chat.completions.create(
-            model=ANSWER_MODEL,
-            messages=[
-                {"role": "system", "content": KEYWORD_EXTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": q},
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        parsed = _safe_json_loads(raw)
-        llm_reason = str(parsed.get("reason", "")).strip() or "no_reason"
-        keywords_raw = parsed.get("keywords", [])
-        if isinstance(keywords_raw, list):
-            llm_raw_keywords = [str(x or "").strip() for x in keywords_raw if str(x or "").strip()]
-            cleaned = _sanitize_keywords(keywords_raw, max_keywords=max_keywords)
-            if cleaned:
-                return KeywordExtractionDecision(
-                    raw_keywords=llm_raw_keywords,
-                    cleaned_keywords=cleaned,
-                    source="llm",
-                    reason=llm_reason,
-                )
-    except Exception as e:
-        llm_reason = f"llm_error:{type(e).__name__}"
-    heuristic = _heuristic_regulation_keywords(q, max_keywords=max_keywords)
-    return KeywordExtractionDecision(
-        raw_keywords=llm_raw_keywords or heuristic,
-        cleaned_keywords=heuristic,
-        source="heuristic_llm_fallback",
-        reason=llm_reason,
+    out = list(_sanitize_keywords(extracted_keywords, max_keywords=max_keywords))
+
+    def _append(items: list[str]) -> None:
+        for item in items:
+            if item not in out:
+                out.append(item)
+
+    bereavement_terms = ("돌아가셨", "상", "사망", "장례")
+    kinship_terms = (
+        "외숙모",
+        "외숙부",
+        "외삼촌",
+        "이모",
+        "고모",
+        "고모부",
+        "조부모",
+        "외조부모",
+        "장인",
+        "장모",
+        "시부",
+        "시모",
+        "형제자매",
+        "인척",
+        "친척",
     )
+
+    if any(t in q for t in kinship_terms):
+        _append(["인척", "경조", "복리후생"])
+    if any(t in q for t in bereavement_terms):
+        _append(["사망", "경조휴가", "경조금", "신청기한", "증빙"])
+    if "경조" in q:
+        _append(["경조휴가", "경조금"])
+
+    return _sanitize_keywords(out, max_keywords=max_keywords)
+
+
+def extract_regulation_keywords(question: str, *, max_keywords: int = 5) -> KeywordExtractionDecision:
+    _intent_decision, keyword_decision = classify_intent_and_keywords(question, max_keywords=max_keywords)
+    return keyword_decision
 
 
 def _build_search_queries(current_question: str, extracted_keywords: list[str]) -> list[str]:
@@ -743,7 +825,7 @@ def _build_intent_notice(
     if brief and _is_placeholder_brief(brief):
         brief = ""
     if no_match and link_count == 0:
-        return "딱 맞는 문서를 고르기는 어려웠지만, 먼저 확인해보시면 도움이 될 만한 규정을 정리해봤어요."
+        return "현재 질문만으로는 적용 대상을 단정하기 어려워요. 확인하려는 가족관계와 상황(예: 사망/결혼/출산)을 알려주시면 관련 규정을 정확히 안내해드릴게요."
     return "확인해볼 만한 사규를 찾아봤어요. 아래 문서부터 보시면 가장 빠르게 판단하실 수 있어요."
 
 
@@ -772,7 +854,7 @@ def _build_doc_brief_description(doc: dict, intent_terms: list[str]) -> str:
 
 def _build_llm_writer_output(
     *,
-    client: OpenAI,
+    client: LLMClient,
     current_question: str,
     intent_terms: list[str],
     selected_docs: list[dict],
@@ -833,6 +915,23 @@ def _replace_doc_id_mentions(text: str, selected_docs: list[dict]) -> str:
         replacement = title or "해당 문서"
         out = re.sub(rf"\b{re.escape(sid)}\b", replacement, out, flags=re.IGNORECASE)
     return out.strip()
+
+
+def _sanitize_writer_text(text: str) -> str:
+    src = str(text or "").strip()
+    if not src:
+        return ""
+    banned_markers = (
+        "인사팀에 문의",
+        "인사팀 문의",
+        "담당부서에 문의",
+        "담당 부서에 문의",
+        "문의해 주세요",
+        "문의하시기 바랍니다",
+    )
+    if any(marker in src for marker in banned_markers):
+        return ""
+    return src
 
 
 def _pick_link_points(doc_keywords: list[str], intent_terms: list[str], *, max_points: int = 3) -> list[str]:
@@ -897,7 +996,7 @@ def _render_link_focused_answer(
             lines.append("")
         lines.append(
             (writer_closing or "").strip()
-            or "필요하시면 질문하신 상황 기준으로 어떤 문서부터 읽으면 되는지 순서까지 짚어드릴게요."
+            or "필요하시면 위 문서 중 어떤 항목을 먼저 확인하면 되는지 함께 정리해드릴게요."
         )
 
     if not lines:
@@ -1056,12 +1155,48 @@ def _is_ambiguous_followup(text: str) -> bool:
     )
     if any(marker in t for marker in followup_markers):
         return True
-    return len(t) <= 18
+    return False
+
+
+def _is_clear_non_regulation_query(text: str) -> bool:
+    """일상/잡담 질문은 topic lock 대상에서 제외한다."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _has_regulation_hints(t):
+        return False
+    non_reg_terms = (
+        "안녕",
+        "하이",
+        "날씨",
+        "기온",
+        "비 와",
+        "눈 와",
+        "미세먼지",
+        "교통",
+        "지하철",
+        "버스",
+        "몇 시",
+        "맛집",
+        "밥",
+        "점심",
+        "저녁",
+        "심심",
+        "잡담",
+    )
+    return any(term in t for term in non_reg_terms)
+
+
+def is_clear_non_regulation_query(text: str) -> bool:
+    """서버 라우팅에서 사용할 공개 헬퍼."""
+    return _is_clear_non_regulation_query(text)
 
 
 def should_topic_lock(messages: list[dict], current_question: str, *, max_user_turns: int = TOPIC_LOCK_MAX_USER_TURNS) -> bool:
     current = _strip_embedded_chat_history(current_question)
     if not current or _is_meta_task_prompt(current):
+        return False
+    if _is_clear_non_regulation_query(current):
         return False
     recent = _recent_user_questions(messages, limit=max_user_turns, exclude_question=current)
     if not recent:
@@ -1095,10 +1230,26 @@ def _all_generic_keywords(keywords: list[str]) -> bool:
     return bool(normalized) and all(k in generic_set for k in normalized)
 
 
-def choose_search_query(messages: list[dict], current_question: str) -> QueryDecision:
+def choose_search_query(
+    messages: list[dict],
+    current_question: str,
+    *,
+    keyword_decision: KeywordExtractionDecision | None = None,
+) -> QueryDecision:
     normalized_question = _strip_embedded_chat_history(current_question)
-    keyword_decision = extract_regulation_keywords(normalized_question, max_keywords=5)
-    extracted_keywords = keyword_decision.cleaned_keywords
+    resolved_keyword_decision = keyword_decision or extract_regulation_keywords(normalized_question, max_keywords=5)
+    extracted_keywords = _augment_event_keywords(
+        normalized_question,
+        resolved_keyword_decision.cleaned_keywords,
+        max_keywords=7,
+    )
+    topic_locked = should_topic_lock(messages, normalized_question)
+    prev_questions = _recent_user_questions(messages, limit=1, exclude_question=normalized_question)
+    prev_question = prev_questions[-1] if prev_questions else ""
+    base_query = normalized_question
+    if topic_locked and _is_ambiguous_followup(normalized_question) and prev_question:
+        # 애매한 후속질문은 직전 질문을 결합해 검색축을 고정한다.
+        base_query = f"{prev_question} {normalized_question}".strip()
 
     # 단일 질의 정책:
     # - 원문 질문 + LLM 추출 핵심키워드를 하나의 검색 질의로 결합
@@ -1108,7 +1259,7 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
         max_user_turns=TOPIC_LOCK_MAX_USER_TURNS,
     )
     context_terms = _sanitize_keywords(context_terms, max_keywords=3)
-    use_context_terms = bool(context_terms and _all_generic_keywords(extracted_keywords))
+    use_context_terms = bool(context_terms and (topic_locked or _all_generic_keywords(extracted_keywords)))
 
     keyword_parts = list(extracted_keywords)
     if use_context_terms:
@@ -1116,9 +1267,9 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
             if kw not in keyword_parts:
                 keyword_parts.append(kw)
     keyword_query = " ".join(keyword_parts).strip()
-    single_query = normalized_question
-    if keyword_query and keyword_query.lower() not in normalized_question.lower():
-        single_query = f"{normalized_question} {keyword_query}".strip()
+    single_query = base_query
+    if keyword_query and keyword_query.lower() not in base_query.lower():
+        single_query = f"{base_query} {keyword_query}".strip()
     search_queries = [single_query] if single_query else [normalized_question]
     raw_results = [_search_with_low_score_fallback(search_queries[0])] if search_queries[0] else []
     merged_result = raw_results[0] if raw_results else SearchResult(query=normalized_question, hits=[], mode="hybrid_single")
@@ -1142,12 +1293,16 @@ def choose_search_query(messages: list[dict], current_question: str) -> QueryDec
         result=final_result,
         extracted_keywords=extracted_keywords,
         search_queries=search_queries or [normalized_question],
-        raw_extracted_keywords=keyword_decision.raw_keywords,
-        keyword_source=keyword_decision.source,
-        keyword_reason=keyword_decision.reason,
+        raw_extracted_keywords=resolved_keyword_decision.raw_keywords,
+        keyword_source=resolved_keyword_decision.source,
+        keyword_reason=resolved_keyword_decision.reason,
         rerank_query=rerank_query,
         debug={
             "query_mode": query_mode,
+            "topic_locked": topic_locked,
+            "prev_question": prev_question,
+            "base_query": base_query,
+            "augmented_keywords": extracted_keywords,
             "context_terms": context_terms,
             "use_context_terms": use_context_terms,
             "raw_result_count": len(raw_results),
@@ -1184,9 +1339,7 @@ def generate_answer_json(
     use_llm_selector: bool = True,
     use_llm_writer: bool = True,
 ) -> dict:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
-    client = OpenAI(api_key=OPENAI_API_KEY.strip(), timeout=120.0)
+    client = LLMClient(timeout=120.0)
 
     context_query = " ".join(decision.extracted_keywords) if decision.extracted_keywords else decision.normalized_query
     answer_context_hits = _select_answer_context_hits(
@@ -1260,8 +1413,10 @@ def generate_answer_json(
         )
         writer_intro = _replace_doc_id_mentions(writer_intro, selected_docs)
         writer_closing = _replace_doc_id_mentions(writer_closing, selected_docs)
+        writer_intro = _sanitize_writer_text(writer_intro)
+        writer_closing = _sanitize_writer_text(writer_closing)
         writer_item_descriptions = {
-            sid: _replace_doc_id_mentions(desc, selected_docs)
+            sid: _sanitize_writer_text(_replace_doc_id_mentions(desc, selected_docs))
             for sid, desc in writer_item_descriptions.items()
         }
 
@@ -1444,7 +1599,7 @@ def _force_link_urls_to_latest(answer: str, latest_hits: list[SearchHit]) -> str
 
 def _rewrite_answer_with_latest_sources_if_needed(
     *,
-    client: OpenAI,
+    client: LLMClient,
     answer: str,
     current_question: str,
     decision: QueryDecision,

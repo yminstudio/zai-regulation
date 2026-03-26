@@ -14,12 +14,13 @@ from starlette.responses import JSONResponse, StreamingResponse
 from src.chat_service import (
     INTENT_NON_REGULATION_THRESHOLD,
     NON_REGULATION_GUIDE_LINE,
-    classify_intent,
+    classify_intent_and_keywords,
     choose_search_query,
     extract_current_user_question,
     generate_non_regulation_answer,
     generate_answer_json,
     has_regulation_hints,
+    is_clear_non_regulation_query,
     is_meta_task_prompt,
     should_topic_lock,
 )
@@ -49,7 +50,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = "gpt-5.4-nano"
+    model: str = ANSWER_MODEL
     messages: list[ChatMessage]
     stream: bool = True
     use_llm_selector: bool = True
@@ -186,15 +187,16 @@ def regulation_chat(req: ChatRequest, request: Request):
         if not current_question:
             raise HTTPException(status_code=400, detail="no user question found in messages")
 
-        intent = classify_intent(current_question)
+        intent, keyword_decision = classify_intent_and_keywords(current_question, max_keywords=5)
         topic_lock = should_topic_lock(messages, current_question)
         meta_task = is_meta_task_prompt(current_question) or intent.reason == "meta_task_prompt_guard"
         regulation_hint_override = (not meta_task) and has_regulation_hints(current_question)
+        clear_non_reg_query = is_clear_non_regulation_query(current_question)
         route = "regulation"
         if (
             intent.intent == "non_regulation"
             and intent.confidence >= INTENT_NON_REGULATION_THRESHOLD
-            and not topic_lock
+            and (not topic_lock or clear_non_reg_query)
             and not regulation_hint_override
         ):
             route = "non_regulation"
@@ -210,6 +212,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                     "reason": intent.reason,
                     "meta_task": meta_task,
                     "topic_lock": topic_lock,
+                    "clear_non_reg_query": clear_non_reg_query,
                     "regulation_hint_override": regulation_hint_override,
                     "route": route,
                     "fallback_answer_preview": fallback_answer[:160],
@@ -220,7 +223,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                 return _stream_openai_delta(fallback_answer, model=MODEL_DISPLAY_NAME)
             return JSONResponse(_chat_completion_payload(model=MODEL_DISPLAY_NAME, content=fallback_answer))
 
-        decision = choose_search_query(messages, current_question)
+        decision = choose_search_query(messages, current_question, keyword_decision=keyword_decision)
         out = generate_answer_json(
             messages=messages,
             current_question=current_question,
@@ -275,6 +278,7 @@ def regulation_chat(req: ChatRequest, request: Request):
                 "intent_reason": intent.reason,
                 "meta_task": meta_task,
                 "topic_lock": topic_lock,
+                "clear_non_reg_query": clear_non_reg_query,
                 "regulation_hint_override": regulation_hint_override,
                 "route": route,
             },
@@ -289,7 +293,7 @@ def regulation_chat(req: ChatRequest, request: Request):
             for case in shadow_cases:
                 if case["use_llm_selector"] == req.use_llm_selector:
                     continue
-                d = choose_search_query(messages, current_question)
+                d = choose_search_query(messages, current_question, keyword_decision=keyword_decision)
                 o = generate_answer_json(
                     messages=messages,
                     current_question=current_question,
